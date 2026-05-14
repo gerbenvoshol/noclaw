@@ -271,7 +271,7 @@ int nc_cmd_onboard(int argc, char **argv) {
     if (strcmp(cfg.default_provider, "ollama") == 0) {
         if (!cfg.api_url[0])
             nc_strlcpy(cfg.api_url, "http://localhost:11434/v1", sizeof(cfg.api_url));
-        if (!model && strcmp(cfg.default_model, "anthropic/claude-sonnet-4") == 0)
+        if (!model)  /* --model not given on CLI; set an ollama-appropriate default */
             nc_strlcpy(cfg.default_model, "llama3.2", sizeof(cfg.default_model));
     }
 
