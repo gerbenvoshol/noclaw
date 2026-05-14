@@ -289,6 +289,12 @@ void nc_config_apply_env(nc_config *cfg) {
         nc_strlcpy(cfg->workspace_dir, v, sizeof(cfg->workspace_dir));
     if ((v = getenv("NOCLAW_BASE_URL")))
         nc_strlcpy(cfg->api_url, v, sizeof(cfg->api_url));
+
+    /* Apply sensible defaults for local providers */
+    if (strcmp(cfg->default_provider, "ollama") == 0) {
+        if (!cfg->api_url[0])
+            nc_strlcpy(cfg->api_url, "http://localhost:11434/v1", sizeof(cfg->api_url));
+    }
 }
 
 /* ── Tests ──────────────────────────────────────────────────────── */
