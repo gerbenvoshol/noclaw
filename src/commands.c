@@ -20,7 +20,9 @@ int nc_cmd_agent(int argc, char **argv) {
         return 1;
     }
 
-    if (!cfg.api_key[0]) {
+    /* Local providers (e.g. ollama) don't need an API key */
+    bool is_local = strcmp(cfg.default_provider, "ollama") == 0;
+    if (!cfg.api_key[0] && !is_local) {
         fprintf(stderr, "No API key configured. Run `noclaw onboard` first\n");
         return 1;
     }
@@ -35,7 +37,8 @@ int nc_cmd_agent(int argc, char **argv) {
             channel_name = argv[++i];
     }
 
-    /* Create provider based on config */
+    /* Create provider based on config.
+     * "ollama" is OpenAI-compatible; base URL defaults to localhost:11434. */
     nc_provider prov;
     if (strcmp(cfg.default_provider, "anthropic") == 0)
         prov = nc_provider_anthropic(cfg.api_key, cfg.api_url);
@@ -203,6 +206,11 @@ int nc_cmd_status(int argc, char **argv) {
 
 /* ── Onboard command ──────────────────────────────────────────── */
 
+/* Returns true if this provider does not require an API key. */
+static bool provider_is_local(const char *name) {
+    return strcmp(name, "ollama") == 0;
+}
+
 int nc_cmd_onboard(int argc, char **argv) {
     nc_config cfg;
     nc_config_defaults(&cfg);
@@ -210,33 +218,34 @@ int nc_cmd_onboard(int argc, char **argv) {
     /* Parse flags */
     const char *api_key = NULL;
     const char *provider = NULL;
+    const char *base_url = NULL;
+    const char *model = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc)
             api_key = argv[++i];
         else if (strcmp(argv[i], "--provider") == 0 && i + 1 < argc)
             provider = argv[++i];
+        else if (strcmp(argv[i], "--base-url") == 0 && i + 1 < argc)
+            base_url = argv[++i];
+        else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc)
+            model = argv[++i];
     }
 
-    if (api_key)
-        nc_strlcpy(cfg.api_key, api_key, sizeof(cfg.api_key));
     if (provider)
         nc_strlcpy(cfg.default_provider, provider, sizeof(cfg.default_provider));
+    if (api_key)
+        nc_strlcpy(cfg.api_key, api_key, sizeof(cfg.api_key));
+    if (base_url)
+        nc_strlcpy(cfg.api_url, base_url, sizeof(cfg.api_url));
+    if (model)
+        nc_strlcpy(cfg.default_model, model, sizeof(cfg.default_model));
 
-    /* Interactive if no api key provided */
-    if (!api_key) {
+    /* Interactive mode when no provider-related flags were given on the CLI */
+    if (!provider && !api_key) {
         printf("noclaw onboard -- quick setup\n\n");
 
-        printf("API key: ");
-        fflush(stdout);
-        char key_buf[256];
-        if (fgets(key_buf, sizeof(key_buf), stdin)) {
-            size_t len = strlen(key_buf);
-            if (len > 0 && key_buf[len - 1] == '\n') key_buf[len - 1] = '\0';
-            nc_strlcpy(cfg.api_key, key_buf, sizeof(cfg.api_key));
-        }
-
-        printf("Provider (openrouter/anthropic/openai) [openrouter]: ");
+        printf("Provider (openrouter/anthropic/openai/ollama) [openrouter]: ");
         fflush(stdout);
         char prov_buf[64];
         if (fgets(prov_buf, sizeof(prov_buf), stdin)) {
@@ -245,6 +254,25 @@ int nc_cmd_onboard(int argc, char **argv) {
             if (prov_buf[0])
                 nc_strlcpy(cfg.default_provider, prov_buf, sizeof(cfg.default_provider));
         }
+
+        if (!provider_is_local(cfg.default_provider)) {
+            printf("API key: ");
+            fflush(stdout);
+            char key_buf[256];
+            if (fgets(key_buf, sizeof(key_buf), stdin)) {
+                size_t len = strlen(key_buf);
+                if (len > 0 && key_buf[len - 1] == '\n') key_buf[len - 1] = '\0';
+                nc_strlcpy(cfg.api_key, key_buf, sizeof(cfg.api_key));
+            }
+        }
+    }
+
+    /* Ollama defaults */
+    if (strcmp(cfg.default_provider, "ollama") == 0) {
+        if (!cfg.api_url[0])
+            nc_strlcpy(cfg.api_url, "http://localhost:11434/v1", sizeof(cfg.api_url));
+        if (!model && strcmp(cfg.default_model, "anthropic/claude-sonnet-4") == 0)
+            nc_strlcpy(cfg.default_model, "llama3.2", sizeof(cfg.default_model));
     }
 
     /* Ensure directories */
@@ -256,6 +284,9 @@ int nc_cmd_onboard(int argc, char **argv) {
         printf("\nConfig saved to: %s\n", cfg.config_path);
         printf("Workspace:       %s\n", cfg.workspace_dir);
         printf("Provider:        %s\n", cfg.default_provider);
+        printf("Model:           %s\n", cfg.default_model);
+        if (cfg.api_url[0])
+            printf("Base URL:        %s\n", cfg.api_url);
         printf("\nRun `noclaw agent` to start chatting!\n");
         return 0;
     }
@@ -297,6 +328,8 @@ int nc_cmd_doctor(int argc, char **argv) {
     printf("  API key:        ");
     if (loaded && cfg.api_key[0]) {
         printf("configured (%.4s...)\n", cfg.api_key);
+    } else if (loaded && provider_is_local(cfg.default_provider)) {
+        printf("not required (%s is local)\n", cfg.default_provider);
     } else {
         printf("NOT SET\n");
         issues++;

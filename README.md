@@ -32,7 +32,7 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 
 ## Features
 
-- **2 providers.** OpenAI-compatible (OpenRouter, etc.) and Anthropic. Adding a new one is filling in a vtable struct.
+- **2 providers.** OpenAI-compatible (OpenRouter, Ollama, LM Studio, etc.) and Anthropic. Adding a new one is filling in a vtable struct.
 - **4 channels.** CLI, Telegram, Discord, Slack. Channels are a vtable, add more as needed.
 - **5 tools.** shell, file_read, file_write, memory_store, memory_recall. Same pattern, add more as needed.
 - **Flat-file memory with keyword search.** The LLM is the ranker. No SQL engine, no embeddings, no vector DB.
@@ -48,8 +48,11 @@ git clone https://github.com/noclaw/noclaw.git
 cd noclaw
 make release
 
-# Setup
+# Setup (cloud)
 ./noclaw onboard --api-key sk-... --provider openrouter
+
+# Setup (local — ollama, no API key needed)
+./noclaw onboard --provider ollama --model llama3.2
 
 # Chat
 ./noclaw agent -m "Hello, noclaw!"
@@ -67,13 +70,65 @@ make release
 ./noclaw doctor
 ```
 
+## Local Models (Ollama)
+
+noclaw works with [Ollama](https://ollama.com) and any other local server that
+exposes an OpenAI-compatible API (LM Studio, llama.cpp server, etc.).
+
+### Quick setup with Ollama
+
+```sh
+# Install and start Ollama (see https://ollama.com)
+ollama pull llama3.2
+
+# Configure noclaw — no API key required
+./noclaw onboard --provider ollama --model llama3.2
+
+# Start chatting
+./noclaw agent -m "Hello!"
+```
+
+`onboard --provider ollama` automatically sets the base URL to
+`http://localhost:11434/v1` and skips the API-key prompt.
+
+### Custom local servers
+
+Use `--base-url` to point at any OpenAI-compatible server:
+
+```sh
+# LM Studio (default port 1234)
+./noclaw onboard --provider ollama --base-url http://localhost:1234/v1 --model mistral
+
+# llama.cpp server
+./noclaw onboard --provider ollama --base-url http://localhost:8080/v1 --model llama3
+
+# Environment variable override (no config rewrite needed)
+NOCLAW_PROVIDER=ollama NOCLAW_BASE_URL=http://localhost:11434/v1 NOCLAW_MODEL=llama3.2 ./noclaw agent
+```
+
+### Ollama config example
+
+```json
+{
+  "default_provider": "ollama",
+  "default_model": "llama3.2",
+  "api_url": "http://localhost:11434/v1",
+  "default_temperature": 0.7,
+  ...
+}
+```
+
+> **Note:** Tool calling works with models that support it (e.g. `llama3.2`,
+> `mistral-nemo`, `qwen2.5`). Models that don't advertise tool-call support will
+> still chat but won't invoke tools.
+
 ## Architecture
 
 Every subsystem is a **function-pointer vtable** -- swap implementations at build or runtime.
 
 | Subsystem     | Interface     | Ships with                                                | Extend                        |
 | ------------- | ------------- | --------------------------------------------------------- | ----------------------------- |
-| **AI Models** | `nc_provider` | OpenAI-compatible, Anthropic                              | Any OpenAI-compatible API     |
+| **AI Models** | `nc_provider` | OpenAI-compatible (OpenRouter, Ollama, LM Studio, …), Anthropic | Any OpenAI-compatible API |
 | **Channels**  | `nc_channel`  | CLI, Telegram, Discord, Slack                             | Any chat platform             |
 | **Memory**    | `nc_memory`   | Flat-file (keyword search)                                | Custom backends               |
 | **Tools**     | `nc_tool`     | shell, file_read, file_write, memory_store, memory_recall | Any capability                |
@@ -117,6 +172,16 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
     "enabled": false,
     "interval_minutes": 30
   }
+}
+```
+
+For local models, omit `api_key` and set `api_url` instead:
+
+```json
+{
+  "default_provider": "ollama",
+  "default_model": "llama3.2",
+  "api_url": "http://localhost:11434/v1"
 }
 ```
 
