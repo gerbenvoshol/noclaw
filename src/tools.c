@@ -103,9 +103,16 @@ static nc_extract_status extract_json_string2(const char *json,
     nc_str s = nc_json_str(val, "");
     if (full_len)
         *full_len = s.len;
-    if (s.len == 0) {
+    if (!val || val->type != NC_JSON_STRING) {
         nc_arena_free(&a);
         return NC_EXTRACT_MISSING;
+    }
+
+    if (s.len == 0) {
+        if (out_cap > 0)
+            out[0] = '\0';
+        nc_arena_free(&a);
+        return NC_EXTRACT_OK;
     }
 
     if (out_cap == 0) {
