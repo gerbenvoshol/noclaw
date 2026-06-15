@@ -43,12 +43,12 @@ static int json_escape_into(char *buf, size_t bufsz, int off, const char *s) {
 static size_t estimate_messages_size(const nc_message *msgs, int count) {
     size_t sz = 512;
     for (int i = 0; i < count; i++) {
-        sz += 256; /* per-message overhead */
+        sz += 512; /* per-message overhead */
         if (msgs[i].content)
             sz += strlen(msgs[i].content) * 2;
         /* tool_calls in assistant messages */
         for (int j = 0; j < msgs[i].tool_call_count; j++) {
-            sz += 256; /* per-call overhead */
+            sz += 512; /* per-call overhead */
             sz += strlen(msgs[i].tool_calls[j].arguments) * 2;
         }
     }
@@ -178,27 +178,44 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); return false; }
 
+    char *template = NULL;
+
     int body_len;
     if (req->tools_json) {
+        if (ctx->api_key[0]) {
+            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_completion_tokens\":%d,\"tools\":%s}";
+        } else {
+            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d,\"tools\":%s}";
+        }
         body_len = snprintf(body, body_sz,
-            "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d,\"tools\":%s}",
+            template,
             req->model, msgs_json, req->temperature,
             req->max_tokens > 0 ? req->max_tokens : 4096,
             req->tools_json);
     } else {
+        if (ctx->api_key[0]) {
+            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_completion_tokens\":%d}";
+        } else {
+            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d}";
+        }
         body_len = snprintf(body, body_sz,
-            "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d}",
+            template,
             req->model, msgs_json, req->temperature,
             req->max_tokens > 0 ? req->max_tokens : 4096);
     }
 
     /* Headers */
+    const char *headers[2];
+    int header_count = 1;
+
+    headers[0] = "Content-Type: application/json";
+
     char auth_hdr[300];
-    snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", ctx->api_key);
-    const char *headers[] = {
-        "Content-Type: application/json",
-        auth_hdr,
-    };
+    if (ctx->api_key[0]) {
+        snprintf(auth_hdr, sizeof(auth_hdr),
+                 "Authorization: Bearer %s", ctx->api_key);
+        headers[header_count++] = auth_hdr;
+    }
 
     /* URL */
     char url[512];
@@ -209,7 +226,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     bool result = false;
     nc_http_response http_resp;
-    if (!nc_http_post(url, body, (size_t)body_len, headers, 2, &http_resp)) {
+    if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {
         nc_log(NC_LOG_ERROR, "HTTP request failed");
         goto cleanup;
     }
@@ -274,6 +291,124 @@ cleanup:
 static void provider_free(nc_provider *self) {
     free(self->ctx);
     self->ctx = NULL;
+}
+
+static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_response *resp) {
+    provider_ctx *ctx = (provider_ctx *)self->ctx;
+    memset(resp, 0, sizeof(*resp));
+
+    /* Gemini OpenAI compatibility endpoint. */
+    size_t msgs_buf_sz = estimate_messages_size(req->messages, req->message_count);
+    char *msgs_json = (char *)malloc(msgs_buf_sz);
+    if (!msgs_json) return false;
+    openai_build_messages(msgs_json, msgs_buf_sz, req->messages, req->message_count);
+
+    size_t body_sz = msgs_buf_sz + 1024 + (req->tools_json ? strlen(req->tools_json) : 0);
+    char *body = (char *)malloc(body_sz);
+    if (!body) { free(msgs_json); return false; }
+
+    int body_len;
+    if (req->tools_json) {
+        body_len = snprintf(body, body_sz,
+            "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d,\"tools\":%s}",
+            req->model, msgs_json, req->temperature,
+            req->max_tokens > 0 ? req->max_tokens : 4096,
+            req->tools_json);
+    } else {
+        body_len = snprintf(body, body_sz,
+            "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d}",
+            req->model, msgs_json, req->temperature,
+            req->max_tokens > 0 ? req->max_tokens : 4096);
+    }
+
+    const char *headers[2];
+    int header_count = 1;
+    headers[0] = "Content-Type: application/json";
+
+    char auth_hdr[300];
+    if (ctx->api_key[0]) {
+        snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", ctx->api_key);
+        headers[header_count++] = auth_hdr;
+    }
+
+    char url[512];
+    if (ctx->api_url[0])
+        snprintf(url, sizeof(url), "%s/chat/completions", ctx->api_url);
+    else
+        snprintf(url, sizeof(url), "https://generativelanguage.googleapis.com/v1beta/openai");
+
+    bool result = false;
+    nc_http_response http_resp;
+    if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {
+        nc_log(NC_LOG_ERROR, "Gemini HTTP request failed");
+        goto cleanup;
+    }
+
+    if (http_resp.status != 200) {
+        nc_log(NC_LOG_ERROR, "Gemini returned HTTP %d: %.200s", http_resp.status, http_resp.body);
+        goto cleanup;
+    }
+
+    {
+        nc_arena a;
+        nc_arena_init(&a, http_resp.body_len * 2 + 1024);
+        nc_json *root = nc_json_parse(&a, http_resp.body, http_resp.body_len);
+
+        if (!root) {
+            nc_log(NC_LOG_ERROR, "Failed to parse Gemini response");
+            nc_arena_free(&a);
+            goto cleanup;
+        }
+
+        nc_json *choices = nc_json_get(root, "choices");
+        if (choices && choices->type == NC_JSON_ARRAY && choices->array.count > 0) {
+            nc_json *choice0 = &choices->array.items[0];
+            nc_json *message = nc_json_get(choice0, "message");
+            if (message) {
+                nc_json *content_node = nc_json_get(message, "content");
+                if (content_node && content_node->type == NC_JSON_STRING) {
+                    nc_str content = content_node->string;
+                    size_t cplen = content.len < sizeof(resp->content) - 1
+                        ? content.len : sizeof(resp->content) - 1;
+                    memcpy(resp->content, content.ptr, cplen);
+                    resp->content[cplen] = '\0';
+                }
+
+                nc_json *tc = nc_json_get(message, "tool_calls");
+                openai_parse_tool_calls(tc, resp);
+            }
+        }
+
+        nc_json *usage = nc_json_get(root, "usage");
+        if (usage) {
+            resp->prompt_tokens = (int)nc_json_num(nc_json_get(usage, "prompt_tokens"), 0);
+            resp->completion_tokens = (int)nc_json_num(nc_json_get(usage, "completion_tokens"), 0);
+        }
+
+        nc_arena_free(&a);
+    }
+
+    result = true;
+
+cleanup:
+    nc_http_response_free(&http_resp);
+    free(msgs_json);
+    free(body);
+    return result;
+}
+
+nc_provider nc_provider_gemini(const char *api_key, const char *api_url) {
+    provider_ctx *ctx = (provider_ctx *)calloc(1, sizeof(provider_ctx));
+    if (!ctx) return (nc_provider){ .name = "gemini", .ctx = NULL, .chat = NULL, .free = NULL };
+    if (api_key) nc_strlcpy(ctx->api_key, api_key, sizeof(ctx->api_key));
+    if (api_url) nc_strlcpy(ctx->api_url, api_url, sizeof(ctx->api_url));
+
+    return (nc_provider){
+        .name = "gemini",
+        .ctx  = ctx,
+        .chat = gemini_chat,
+        .free = provider_free,
+    };
 }
 
 nc_provider nc_provider_openai(const char *api_key, const char *api_url) {

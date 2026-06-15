@@ -5,6 +5,10 @@ CC      ?= cc
 CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -Wno-unused-parameter
 LDFLAGS :=
 
+BEARSSL_DIR := vendor/BearSSL
+BEARSSL_INC := $(BEARSSL_DIR)/inc
+BEARSSL_LIB := $(BEARSSL_DIR)/build/libbearssl.a
+
 # Source files
 SRCS := $(wildcard src/*.c)
 OBJS := $(SRCS:.c=.o)
@@ -20,13 +24,14 @@ ifeq ($(UNAME),Darwin)
   # macOS: SecureTransport for TLS (system framework, no extra deps)
   LDFLAGS += -framework Security -framework CoreFoundation
 else
-  # Linux: BearSSL for TLS (tiny footprint, ~200KB RSS vs OpenSSL's ~4.6MB)
-  LDFLAGS += -lbearssl
+  # Linux: build against vendored BearSSL
+  CFLAGS += -I$(BEARSSL_INC)
+  LDFLAGS += $(BEARSSL_LIB)
 endif
 
 # ── Build modes ──────────────────────────────────────────────────
 
-.PHONY: all release debug clean test install uninstall
+.PHONY: all release debug clean test install uninstall bearssl
 
 all: release
 
@@ -45,8 +50,11 @@ debug: $(BIN)
 
 # ── Link ─────────────────────────────────────────────────────────
 
-$(BIN): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(BIN): $(OBJS) $(if $(filter Darwin,$(UNAME)),,$(BEARSSL_LIB))
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+$(BEARSSL_LIB):
+	$(MAKE) -C $(BEARSSL_DIR) lib
 
 # ── Compile ──────────────────────────────────────────────────────
 
@@ -56,7 +64,7 @@ src/%.o: src/%.c src/nc.h
 # ── Test ─────────────────────────────────────────────────────────
 
 test: CFLAGS += -O0 -g -DDEBUG -DNC_TEST
-test:
+test: $(if $(filter Darwin,$(UNAME)),,$(BEARSSL_LIB))
 	$(CC) $(CFLAGS) -o noclaw_test src/*.c -DNC_TEST_MAIN $(LDFLAGS)
 	./noclaw_test
 	@rm -f noclaw_test
@@ -65,9 +73,9 @@ test:
 
 .PHONY: musl
 musl: CC := musl-gcc
-musl: CFLAGS  += -Os -DNDEBUG -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -Iinc
-musl: LDFLAGS := -static lib/libbearssl.a -lm -flto -Wl,--gc-sections
-musl: $(BIN)
+musl: CFLAGS  += -Os -DNDEBUG -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -I$(BEARSSL_INC)
+musl: LDFLAGS := -static $(BEARSSL_LIB) -lm -flto -Wl,--gc-sections
+musl: $(BEARSSL_LIB) $(BIN)
 	@strip -s $(BIN)
 	@ls -lh $(BIN) | awk '{print "Binary: " $$5 " (static, stripped)"}'
 

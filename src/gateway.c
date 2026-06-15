@@ -34,8 +34,10 @@ static void send_response(int fd, int status, const char *content_type, const ch
         "\r\n",
         status, status_text, content_type, strlen(body));
 
-    write(fd, header, (size_t)hlen);
-    write(fd, body, strlen(body));
+    ssize_t ignored = write(fd, header, (size_t)hlen);
+    (void)ignored;
+    ignored = write(fd, body, strlen(body));
+    (void)ignored;
 }
 
 static void send_json(int fd, int status, const char *json) {

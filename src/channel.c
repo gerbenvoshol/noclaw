@@ -8,28 +8,183 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 /* ── CLI channel ──────────────────────────────────────────────── */
 
-static bool cli_poll(nc_channel *self, nc_incoming_msg *out) {
-    (void)self;
-    memset(out, 0, sizeof(*out));
+typedef struct {
+    char history[32][4096];
+    int history_count;
+    int history_pos;
+} cli_ctx;
+
+static size_t cli_term_columns(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+
+static void cli_refresh_line(const char *buf, size_t len, size_t cursor) {
+    size_t prompt_len = 5; /* "you> " */
+    size_t cols = cli_term_columns();
+    size_t total = prompt_len + len;
+    size_t lines = cols ? (total / cols) + 1 : 1;
+
+    printf("\r");
+    if (lines > 1)
+        printf("\x1b[%zuA", lines - 1);
+    printf("you> %.*s\x1b[J", (int)len, buf);
+
+    if (len > cursor)
+        printf("\x1b[%zuD", len - cursor);
+    fflush(stdout);
+}
+
+static bool cli_readline(cli_ctx *ctx, char *out, size_t out_cap) {
+    if (!isatty(STDIN_FILENO)) {
+        if (!fgets(out, out_cap, stdin))
+            return false;
+        size_t len = strlen(out);
+        if (len > 0 && out[len - 1] == '\n')
+            out[len - 1] = '\0';
+        return out[0] != '\0';
+    }
+
+    struct termios oldt, raw;
+    if (tcgetattr(STDIN_FILENO, &oldt) != 0)
+        return false;
+    raw = oldt;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0)
+        return false;
+
+    size_t len = 0;
+    size_t cursor = 0;
+    out[0] = '\0';
+    ctx->history_pos = ctx->history_count;
 
     printf("you> ");
     fflush(stdout);
 
-    if (!fgets(out->content, sizeof(out->content), stdin))
+    for (;;) {
+        unsigned char ch;
+        ssize_t n = read(STDIN_FILENO, &ch, 1);
+        if (n <= 0) {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+            printf("\n");
+            return false;
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            out[len] = '\0';
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+            printf("\n");
+            return out[0] != '\0';
+        }
+
+        if (ch == 4) {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+            printf("\n");
+            return false;
+        }
+
+        if (ch == 127 || ch == 8) {
+            if (cursor > 0 && len > 0) {
+                memmove(out + cursor - 1, out + cursor, len - cursor + 1);
+                cursor--;
+                len--;
+                cli_refresh_line(out, len, cursor);
+            }
+            continue;
+        }
+
+        if (ch == 27) {
+            unsigned char seq1 = 0, seq2 = 0, seq3 = 0;
+            if (read(STDIN_FILENO, &seq1, 1) <= 0)
+                continue;
+            if (seq1 != '[')
+                continue;
+            if (read(STDIN_FILENO, &seq2, 1) <= 0)
+                continue;
+
+            if (seq2 == 'A') {
+                if (ctx->history_count > 0 && ctx->history_pos > 0) {
+                    ctx->history_pos--;
+                    nc_strlcpy(out, ctx->history[ctx->history_pos], out_cap);
+                    len = strlen(out);
+                    cursor = len;
+                    cli_refresh_line(out, len, cursor);
+                }
+            } else if (seq2 == 'B') {
+                if (ctx->history_pos < ctx->history_count) {
+                    ctx->history_pos++;
+                    if (ctx->history_pos == ctx->history_count) {
+                        out[0] = '\0';
+                        len = 0;
+                    } else {
+                        nc_strlcpy(out, ctx->history[ctx->history_pos], out_cap);
+                        len = strlen(out);
+                    }
+                    cursor = len;
+                    cli_refresh_line(out, len, cursor);
+                }
+            } else if (seq2 == 'C') {
+                if (cursor < len) {
+                    cursor++;
+                    cli_refresh_line(out, len, cursor);
+                }
+            } else if (seq2 == 'D') {
+                if (cursor > 0) {
+                    cursor--;
+                    cli_refresh_line(out, len, cursor);
+                }
+            } else if (seq2 == '3') {
+                if (read(STDIN_FILENO, &seq3, 1) > 0 && seq3 == '~' && cursor < len) {
+                    memmove(out + cursor, out + cursor + 1, len - cursor);
+                    len--;
+                    cli_refresh_line(out, len, cursor);
+                }
+            }
+            continue;
+        }
+
+        if (ch >= 32 && ch < 127) {
+            if (len + 1 < out_cap) {
+                memmove(out + cursor + 1, out + cursor, len - cursor + 1);
+                out[cursor] = (char)ch;
+                cursor++;
+                len++;
+                cli_refresh_line(out, len, cursor);
+            }
+        }
+    }
+}
+
+static void cli_history_add(cli_ctx *ctx, const char *line) {
+    if (!line[0])
+        return;
+    if (ctx->history_count > 0 && strcmp(ctx->history[ctx->history_count - 1], line) == 0)
+        return;
+    if (ctx->history_count < (int)(sizeof(ctx->history) / sizeof(ctx->history[0]))) {
+        nc_strlcpy(ctx->history[ctx->history_count++], line, sizeof(ctx->history[0]));
+        return;
+    }
+    memmove(ctx->history, ctx->history + 1, sizeof(ctx->history) - sizeof(ctx->history[0]));
+    nc_strlcpy(ctx->history[ctx->history_count - 1], line, sizeof(ctx->history[0]));
+}
+
+static bool cli_poll(nc_channel *self, nc_incoming_msg *out) {
+    cli_ctx *ctx = (cli_ctx *)self->ctx;
+    memset(out, 0, sizeof(*out));
+
+    if (!cli_readline(ctx, out->content, sizeof(out->content)))
         return false;
 
-    /* Strip trailing newline */
-    size_t len = strlen(out->content);
-    if (len > 0 && out->content[len - 1] == '\n')
-        out->content[len - 1] = '\0';
-
-    /* Skip empty lines */
-    if (out->content[0] == '\0')
-        return false;
-
+    cli_history_add(ctx, out->content);
     nc_strlcpy(out->sender, "cli", sizeof(out->sender));
     nc_strlcpy(out->channel_name, "cli", sizeof(out->channel_name));
     return true;
@@ -43,13 +198,15 @@ static bool cli_send(nc_channel *self, const char *to, const char *text) {
 }
 
 static void cli_free(nc_channel *self) {
-    (void)self;
+    free(self->ctx);
+    self->ctx = NULL;
 }
 
 nc_channel nc_channel_cli(void) {
+    cli_ctx *ctx = (cli_ctx *)calloc(1, sizeof(cli_ctx));
     return (nc_channel){
         .name = "cli",
-        .ctx  = NULL,
+        .ctx  = ctx,
         .poll = cli_poll,
         .send = cli_send,
         .free = cli_free,

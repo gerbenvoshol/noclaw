@@ -19,7 +19,7 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 | **RAM**               | > 1 GB                                           | > 100 MB                                    | < 10 MB                                        | < 5 MB                                                | ~1 MB\*                                          | **324 KB**           |
 | **Startup (0.8 GHz)** | > 500 s                                          | > 30 s                                      | < 1 s                                          | < 10 ms                                               | < 8 ms                                           | **idk man**          |
 | **Binary Size**       | ~28 MB (dist)                                    | 363 MB (installed)                          | ~8 MB                                          | 3.4 MB                                                | 678 KB                                           | **88 KB**\*\*        |
-| **Build Deps**        | node, pnpm, 1,219 pkgs                           | pip, 103 pkgs                               | go, 82 modules                                 | rustc, cargo, 737 crates                              | zig, libsqlite3                                  | **cc, libbearssl**   |
+| **Build Deps**        | node, pnpm, 1,219 pkgs                           | pip, 103 pkgs                               | go, 82 modules                                 | rustc, cargo, 737 crates                              | zig, libsqlite3                                  | **cc, make**   |
 | **Runtime Deps**      | node + npm                                       | python + pip                                | libc                                           | libc                                                  | libc + curl                                      | **0**                |
 | **Source Files**      | ~400+                                            | ~54                                         | ~129                                           | ~120                                                  | ~110                                             | **~14**              |
 | **Cost**              | Mac Mini $599                                    | Linux SBC ~$50                              | Linux Board $10                                | Any $10 hardware                                      | Any $5 hardware                                  | **Any 50¢ hardware** |
@@ -32,7 +32,7 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 
 ## Features
 
-- **2 providers.** OpenAI-compatible (OpenRouter, Ollama, LM Studio, etc.) and Anthropic. Adding a new one is filling in a vtable struct.
+- **3 providers.** OpenAI-compatible (OpenRouter, Ollama, LM Studio, etc.), Anthropic, and Gemini. Adding a new one is filling in a vtable struct.
 - **4 channels.** CLI, Telegram, Discord, Slack. Channels are a vtable, add more as needed.
 - **5 tools.** shell, file_read, file_write, memory_store, memory_recall. Same pattern, add more as needed.
 - **Flat-file memory with keyword search.** The LLM is the ranker. No SQL engine, no embeddings, no vector DB.
@@ -43,8 +43,10 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 
 ## Quick Start
 
+BearSSL is vendored as a git submodule under `vendor/BearSSL`. Clone with `--recurse-submodules`, or run `git submodule update --init --recursive` after cloning.
+
 ```sh
-git clone https://github.com/noclaw/noclaw.git
+git clone --recurse-submodules https://github.com/noclaw/noclaw.git
 cd noclaw
 make release
 
@@ -53,6 +55,9 @@ make release
 
 # Setup (local — ollama, no API key needed)
 ./noclaw onboard --provider ollama --model llama3.2
+
+# Setup (Gemini)
+./noclaw onboard --provider gemini --api-key AIza... --model gemini-2.5-flash
 
 # Chat
 ./noclaw agent -m "Hello, noclaw!"
@@ -83,6 +88,9 @@ ollama pull llama3.2
 
 # Configure noclaw — no API key required
 ./noclaw onboard --provider ollama --model llama3.2
+
+# Setup (Gemini)
+./noclaw onboard --provider gemini --api-key AIza... --model gemini-2.5-flash
 
 # Start chatting
 ./noclaw agent -m "Hello!"
@@ -118,6 +126,22 @@ NOCLAW_PROVIDER=ollama NOCLAW_BASE_URL=http://localhost:11434/v1 NOCLAW_MODEL=ll
 }
 ```
 
+## Gemini
+
+Gemini support uses Google's OpenAI-compatible endpoint. Configure it like this:
+
+```sh
+./noclaw onboard --provider gemini --api-key AIza... --model gemini-2.5-flash
+```
+
+Default base URL for the `gemini` provider:
+
+```
+https://generativelanguage.googleapis.com/v1beta/openai
+```
+
+You can override it with `--base-url` or `NOCLAW_BASE_URL`.
+
 > **Note:** Tool calling works with models that support it (e.g. `llama3.2`,
 > `mistral-nemo`, `qwen2.5`). Models that don't advertise tool-call support will
 > still chat but won't invoke tools.
@@ -128,7 +152,7 @@ Every subsystem is a **function-pointer vtable** -- swap implementations at buil
 
 | Subsystem     | Interface     | Ships with                                                | Extend                        |
 | ------------- | ------------- | --------------------------------------------------------- | ----------------------------- |
-| **AI Models** | `nc_provider` | OpenAI-compatible (OpenRouter, Ollama, LM Studio, …), Anthropic | Any OpenAI-compatible API |
+| **AI Models** | `nc_provider` | OpenAI-compatible (OpenRouter, Ollama, LM Studio, …), Anthropic, Gemini | Any OpenAI-compatible API |
 | **Channels**  | `nc_channel`  | CLI, Telegram, Discord, Slack                             | Any chat platform             |
 | **Memory**    | `nc_memory`   | Flat-file (keyword search)                                | Custom backends               |
 | **Tools**     | `nc_tool`     | shell, file_read, file_write, memory_store, memory_recall | Any capability                |
@@ -185,7 +209,7 @@ For local models, omit `api_key` and set `api_url` instead:
 }
 ```
 
-Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_BASE_URL`.
+Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
 
 ## Gateway API
 
@@ -228,7 +252,7 @@ src/
   json.c       Recursive-descent JSON parser + writer (zero deps)
   config.c     Config loader (~/.noclaw/config.json)
   http.c       HTTP client (platform TLS)
-  provider.c   Provider vtable: OpenAI-compatible + Anthropic
+  provider.c   Provider vtable: OpenAI-compatible + Anthropic + Gemini
   channel.c    Channel vtable: CLI, Telegram, Discord, Slack
   tools.c      Tool vtable: shell, file_read, file_write, memory
   memory.c     Memory vtable: flat-file keyword search
@@ -247,7 +271,7 @@ Tests:          87
 Binary:         ~270 KB static musl (Linux), ~88 KB dynamic (macOS arm64)
 Peak RSS:       324 KB (Linux musl), ~1.9 MB (Linux glibc), ~5.6 MB (macOS)
 Startup:        idk man (no 0.8 GHz test hardware)
-Dependencies:   none (static musl) or libc+bearssl (dynamic)
+Dependencies:   none beyond libc on macOS, or libc+vendored BearSSL on Linux
 ```
 
 ## Why C

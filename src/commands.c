@@ -42,6 +42,8 @@ int nc_cmd_agent(int argc, char **argv) {
     nc_provider prov;
     if (strcmp(cfg.default_provider, "anthropic") == 0)
         prov = nc_provider_anthropic(cfg.api_key, cfg.api_url);
+    else if (strcmp(cfg.default_provider, "gemini") == 0)
+        prov = nc_provider_gemini(cfg.api_key, cfg.api_url);
     else
         prov = nc_provider_openai(cfg.api_key, cfg.api_url);
 
@@ -55,6 +57,7 @@ int nc_cmd_agent(int argc, char **argv) {
     nc_tool tools[NC_MAX_TOOLS];
     int tool_count = 0;
     tools[tool_count++] = nc_tool_shell(&cfg);
+    tools[tool_count++] = nc_tool_apply_patch(&cfg);
     tools[tool_count++] = nc_tool_file_read(&cfg);
     tools[tool_count++] = nc_tool_file_write(&cfg);
     tools[tool_count++] = nc_tool_memory_store(&mem);
@@ -152,6 +155,8 @@ int nc_cmd_gateway(int argc, char **argv) {
     nc_provider prov;
     if (strcmp(cfg.default_provider, "anthropic") == 0)
         prov = nc_provider_anthropic(cfg.api_key, cfg.api_url);
+    else if (strcmp(cfg.default_provider, "gemini") == 0)
+        prov = nc_provider_gemini(cfg.api_key, cfg.api_url);
     else
         prov = nc_provider_openai(cfg.api_key, cfg.api_url);
 
@@ -164,6 +169,7 @@ int nc_cmd_gateway(int argc, char **argv) {
     nc_tool tools[NC_MAX_TOOLS];
     int tool_count = 0;
     tools[tool_count++] = nc_tool_shell(&cfg);
+    tools[tool_count++] = nc_tool_apply_patch(&cfg);
     tools[tool_count++] = nc_tool_file_read(&cfg);
     tools[tool_count++] = nc_tool_file_write(&cfg);
     tools[tool_count++] = nc_tool_memory_store(&mem);
@@ -215,6 +221,22 @@ int nc_cmd_onboard(int argc, char **argv) {
     nc_config cfg;
     nc_config_defaults(&cfg);
 
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("noclaw onboard -- quick setup\n\n");
+            printf("USAGE:\n");
+            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL]\n\n");
+            printf("OPTIONS:\n");
+            printf("  --provider PROVIDER  openrouter, anthropic, openai, gemini, ollama\n");
+            printf("  --api-key KEY        API key for remote providers\n");
+            printf("  --base-url URL       OpenAI-compatible base URL\n");
+            printf("  --model MODEL        Default model to use\n");
+            printf("  -h, --help           Show this help\n\n");
+            printf("If no provider/api key is passed, onboard runs interactively and asks for setup values.\n");
+            return 0;
+        }
+    }
+
     /* Parse flags */
     const char *api_key = NULL;
     const char *provider = NULL;
@@ -245,7 +267,7 @@ int nc_cmd_onboard(int argc, char **argv) {
     if (!provider && !api_key) {
         printf("noclaw onboard -- quick setup\n\n");
 
-        printf("Provider (openrouter/anthropic/openai/ollama) [openrouter]: ");
+        printf("Provider (openrouter/anthropic/openai/gemini/ollama) [openrouter]: ");
         fflush(stdout);
         char prov_buf[64];
         if (fgets(prov_buf, sizeof(prov_buf), stdin)) {
@@ -264,6 +286,26 @@ int nc_cmd_onboard(int argc, char **argv) {
                 if (len > 0 && key_buf[len - 1] == '\n') key_buf[len - 1] = '\0';
                 nc_strlcpy(cfg.api_key, key_buf, sizeof(cfg.api_key));
             }
+        }
+
+        printf("Base URL (optional): ");
+        fflush(stdout);
+        char url_buf[256];
+        if (fgets(url_buf, sizeof(url_buf), stdin)) {
+            size_t len = strlen(url_buf);
+            if (len > 0 && url_buf[len - 1] == '\n') url_buf[len - 1] = '\0';
+            if (url_buf[0])
+                nc_strlcpy(cfg.api_url, url_buf, sizeof(cfg.api_url));
+        }
+
+        printf("Model [%s]: ", cfg.default_model);
+        fflush(stdout);
+        char model_buf[128];
+        if (fgets(model_buf, sizeof(model_buf), stdin)) {
+            size_t len = strlen(model_buf);
+            if (len > 0 && model_buf[len - 1] == '\n') model_buf[len - 1] = '\0';
+            if (model_buf[0])
+                nc_strlcpy(cfg.default_model, model_buf, sizeof(cfg.default_model));
         }
     }
 

@@ -7,62 +7,244 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <stdarg.h>
+#include <fcntl.h>
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include <limits.h>
+
+static bool path_is_safe_relative(const char *path);
 
 /* ── Helper: extract string from tool args JSON ───────────────── */
 
-static bool extract_json_string(const char *json, const char *key,
-                                char *out, size_t out_cap) {
+static size_t json_escape(const char *src, size_t len,
+                          char *dst, size_t cap)
+{
+    size_t j = 0;
+
+    for (size_t i = 0; i < len && j + 1 < cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+
+        switch (c) {
+        case '"':
+            if (j + 2 >= cap) goto done;
+            dst[j++] = '\\';
+            dst[j++] = '"';
+            break;
+
+        case '\\':
+            if (j + 2 >= cap) goto done;
+            dst[j++] = '\\';
+            dst[j++] = '\\';
+            break;
+
+        case '\n':
+            if (j + 2 >= cap) goto done;
+            dst[j++] = '\\';
+            dst[j++] = 'n';
+            break;
+
+        case '\r':
+            if (j + 2 >= cap) goto done;
+            dst[j++] = '\\';
+            dst[j++] = 'r';
+            break;
+
+        case '\t':
+            if (j + 2 >= cap) goto done;
+            dst[j++] = '\\';
+            dst[j++] = 't';
+            break;
+
+        default:
+            if (c < 0x20) {
+                if (j + 6 >= cap) goto done;
+                snprintf(dst + j, cap - j, "\\u%04x", c);
+                j += 6;
+            } else {
+                dst[j++] = (char)c;
+            }
+        }
+    }
+
+done:
+    dst[j] = '\0';
+    return j;
+}
+
+typedef enum {
+    NC_EXTRACT_OK = 0,
+    NC_EXTRACT_MISSING,
+    NC_EXTRACT_EMPTY,
+    NC_EXTRACT_TRUNCATED,
+    NC_EXTRACT_INVALID_JSON
+} nc_extract_status;
+
+static nc_extract_status extract_json_string2(const char *json,
+                                              const char *key,
+                                              char *out,
+                                              size_t out_cap,
+                                              size_t *full_len) {
     nc_arena a;
     nc_arena_init(&a, strlen(json) * 2 + 256);
     nc_json *root = nc_json_parse(&a, json, strlen(json));
-    if (!root) { nc_arena_free(&a); return false; }
+    if (!root) {
+        nc_arena_free(&a);
+        return NC_EXTRACT_INVALID_JSON;
+    }
 
     nc_json *val = nc_json_get(root, key);
     nc_str s = nc_json_str(val, "");
-    if (s.len == 0) { nc_arena_free(&a); return false; }
+    if (full_len)
+        *full_len = s.len;
+    if (s.len == 0) {
+        nc_arena_free(&a);
+        return NC_EXTRACT_MISSING;
+    }
+
+    if (out_cap == 0) {
+        nc_arena_free(&a);
+        return NC_EXTRACT_TRUNCATED;
+    }
 
     size_t cplen = s.len < out_cap - 1 ? s.len : out_cap - 1;
     memcpy(out, s.ptr, cplen);
     out[cplen] = '\0';
     nc_arena_free(&a);
-    return true;
+    return s.len > cplen ? NC_EXTRACT_TRUNCATED : NC_EXTRACT_OK;
+}
+
+static bool extract_json_string(const char *json, const char *key,
+                                char *out, size_t out_cap) {
+    return extract_json_string2(json, key, out, out_cap, NULL) == NC_EXTRACT_OK;
+}
+
+static bool append_suffix(char *out, size_t out_cap, const char *suffix)
+{
+    size_t total = strlen(out);
+    size_t sl = strlen(suffix);
+    size_t full_sl = sl;
+
+    if (total >= out_cap)
+        return false;
+
+    if (sl > out_cap - total - 1)
+        sl = out_cap - total - 1;
+
+    memcpy(out + total, suffix, sl);
+    out[total + sl] = '\0';
+    return sl == full_sl;
+}
+
+static void tool_debug(const char *tool, const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    nc_log(NC_LOG_INFO, "[tool:%s] %s", tool, msg);
+}
+
+static void tool_debug_preview(const char *tool,
+                               const char *label,
+                               const char *data,
+                               size_t len)
+{
+    char preview[NC_LOG_PREVIEW_MAX + 32];
+    size_t shown;
+
+    if (!data)
+        data = "";
+
+    shown = len < NC_LOG_PREVIEW_MAX ? len : NC_LOG_PREVIEW_MAX;
+    memcpy(preview, data, shown);
+    preview[shown] = '\0';
+
+    if (shown < len)
+        nc_log(NC_LOG_INFO,
+               "[tool:%s] %s (%zu bytes, preview %zu): %s...[truncated for log]",
+               tool, label, len, shown, preview);
+    else
+        nc_log(NC_LOG_INFO,
+               "[tool:%s] %s (%zu bytes): %s",
+               tool, label, len, preview);
 }
 
 /* ── Shell tool ───────────────────────────────────────────────── */
 
 static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
-    char command[2048];
+    char command[NC_SHELL_COMMAND_MAX];
+    char shell_cmd[NC_SHELL_COMMAND_MAX + PATH_MAX + 64];
+    size_t full_len = 0;
+    nc_extract_status est;
 
-    if (!extract_json_string(args_json, "command", command, sizeof(command))) {
+    if (out_cap == 0)
+        return false;
+
+    out[0] = '\0';
+
+    est = extract_json_string2(args_json, "command", command, sizeof(command), &full_len);
+    if (est == NC_EXTRACT_INVALID_JSON) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        return false;
+    }
+    if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'command' argument", out_cap);
         return false;
     }
-
-    /* Security: workspace scoping */
-    if (cfg->workspace_only) {
-        /* Validate workspace_dir has no shell-dangerous chars */
-        const char *ws = cfg->workspace_dir;
-        for (const char *c = ws; *c; c++) {
-            if (*c == '\'' || *c == '\\' || *c == '"' || *c == '$' ||
-                *c == '`' || *c == '!' || *c == ';' || *c == '|' ||
-                *c == '&' || *c == '\n') {
-                nc_strlcpy(out, "error: workspace path contains unsafe characters", out_cap);
-                return false;
-            }
-        }
-        /* Prepend cd to workspace */
-        char full_cmd[4096];
-        snprintf(full_cmd, sizeof(full_cmd), "cd '%s' && %s", cfg->workspace_dir, command);
-        nc_strlcpy(command, full_cmd, sizeof(command));
+    if (est == NC_EXTRACT_TRUNCATED) {
+        snprintf(out, out_cap,
+                 "error: 'command' argument too long (%zu bytes, max %zu)",
+                 full_len, sizeof(command) - 1);
+        return false;
     }
 
-    /* Execute and capture output */
-    FILE *fp = popen(command, "r");
+    if (command[0] == '\0') {
+        nc_strlcpy(out, "error: empty command", out_cap);
+        return false;
+    }
+
+    tool_debug_preview("shell", "command", command, strlen(command));
+
+    if (cfg->workspace_only) {
+        char workspace[PATH_MAX];
+        int n;
+
+        if (!realpath(cfg->workspace_dir, workspace)) {
+            nc_strlcpy(out, "error: invalid workspace path", out_cap);
+            return false;
+        }
+
+        n = snprintf(shell_cmd, sizeof(shell_cmd),
+                     "cd \"%s\" && %s 2>&1",
+                     workspace, command);
+        if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
+            nc_strlcpy(out, "error: command too long", out_cap);
+            return false;
+        }
+    } else {
+        int n = snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1", command);
+        if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
+            nc_strlcpy(out, "error: command too long", out_cap);
+            return false;
+        }
+    }
+
+    FILE *fp = popen(shell_cmd, "r");
     if (!fp) {
-        nc_strlcpy(out, "error: failed to execute command", out_cap);
+        snprintf(out, out_cap,
+                 "error: failed to execute command: %s",
+                 strerror(errno));
         return false;
     }
 
@@ -70,23 +252,47 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
     char buf[1024];
     while (fgets(buf, sizeof(buf), fp) && total < out_cap - 1) {
         size_t n = strlen(buf);
-        if (total + n >= out_cap - 1) n = out_cap - 1 - total;
+        if (total + n >= out_cap - 1)
+            n = out_cap - 1 - total;
         memcpy(out + total, buf, n);
         total += n;
     }
     out[total] = '\0';
+    if (!feof(fp))
+        append_suffix(out, out_cap, "\n[output truncated]");
+
     int status = pclose(fp);
 
-    if (status != 0) {
-        char suffix[64];
-        snprintf(suffix, sizeof(suffix), "\n[exit code: %d]", WEXITSTATUS(status));
-        size_t sl = strlen(suffix);
-        if (total + sl < out_cap) {
-            memcpy(out + total, suffix, sl + 1);
-        }
+    if (status == -1) {
+        snprintf(out, out_cap,
+                 "error: failed to close shell process: %s",
+                 strerror(errno));
+        return false;
     }
 
-    return status == 0;
+    if (!WIFEXITED(status)) {
+        if (WIFSIGNALED(status)) {
+            char suffix[64];
+            int n = snprintf(suffix, sizeof(suffix),
+                             "\n[terminated by signal: %d]",
+                             WTERMSIG(status));
+            if (n >= 0)
+                append_suffix(out, out_cap, suffix);
+        } else {
+            append_suffix(out, out_cap, "\n[process terminated abnormally]");
+        }
+        return false;
+    }
+
+    if (WEXITSTATUS(status) != 0) {
+        char suffix[64];
+        int n = snprintf(suffix, sizeof(suffix), "\n[exit code: %d]", WEXITSTATUS(status));
+        if (n >= 0)
+            append_suffix(out, out_cap, suffix);
+        return false;
+    }
+
+    return true;
 }
 
 nc_tool nc_tool_shell(const nc_config *cfg) {
@@ -105,51 +311,109 @@ nc_tool nc_tool_shell(const nc_config *cfg) {
 
 /* ── File read tool ───────────────────────────────────────────── */
 
+static bool path_within_workspace(const char *path,
+                                  const char *workspace)
+{
+    size_t n = strlen(workspace);
+
+    return strncmp(path, workspace, n) == 0 &&
+           (path[n] == '\0' || path[n] == '/');
+}
+
 static bool file_read_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
     char path[1024];
+    char read_path[PATH_MAX];
+    size_t full_len = 0;
+    nc_extract_status est = extract_json_string2(args_json, "path", path, sizeof(path), &full_len);
 
-    if (!extract_json_string(args_json, "path", path, sizeof(path))) {
+    if (est == NC_EXTRACT_INVALID_JSON) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        return false;
+    }
+    if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'path' argument", out_cap);
+        return false;
+    }
+    if (est == NC_EXTRACT_TRUNCATED) {
+        snprintf(out, out_cap, "error: 'path' argument too long (%zu bytes, max %zu)",
+                 full_len, sizeof(path) - 1);
         return false;
     }
 
     /* Security: workspace scoping */
     if (cfg->workspace_only) {
-        if (path[0] == '/') {
-            nc_strlcpy(out, "error: absolute paths not allowed in workspace mode", out_cap);
-            return false;
-        }
-        char full_path[2048];
-        nc_path_join(full_path, sizeof(full_path), cfg->workspace_dir, path);
-        nc_strlcpy(path, full_path, sizeof(path));
-    }
+        char candidate[PATH_MAX];
+        char resolved[PATH_MAX];
+        char workspace[PATH_MAX];
 
-    /* Check for path traversal (/../ components, or leading ../) */
-    {
-        const char *p = path;
-        while (*p) {
-            if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0')) {
+        if (path[0] == '/') {
+            if (nc_strlcpy(candidate, path, sizeof(candidate)) >= sizeof(candidate)) {
+                nc_strlcpy(out, "error: path too long", out_cap);
+                return false;
+            }
+        } else {
+            if (!path_is_safe_relative(path)) {
                 nc_strlcpy(out, "error: path traversal not allowed", out_cap);
                 return false;
             }
-            /* Advance to next path component */
-            const char *sl = strchr(p, '/');
-            if (!sl) break;
-            p = sl + 1;
+            if (!nc_path_join(candidate, sizeof(candidate),
+                              cfg->workspace_dir, path)) {
+                nc_strlcpy(out, "error: path too long", out_cap);
+                return false;
+            }
+        }
+
+        if (!realpath(candidate, resolved)) {
+            snprintf(out, out_cap,
+                     "error: cannot resolve file '%s'", path);
+            return false;
+        }
+
+        if (!realpath(cfg->workspace_dir, workspace)) {
+            nc_strlcpy(out,
+                       "error: invalid workspace path",
+                       out_cap);
+            return false;
+        }
+
+        if (!path_within_workspace(resolved, workspace)) {
+            nc_strlcpy(out,
+                       "error: path escapes workspace",
+                       out_cap);
+            return false;
+        }
+
+        if (nc_strlcpy(read_path, resolved, sizeof(read_path)) >= sizeof(read_path)) {
+            nc_strlcpy(out, "error: path too long", out_cap);
+            return false;
+        }
+    } else {
+        if (path[0] == '/') {
+            if (nc_strlcpy(read_path, path, sizeof(read_path)) >= sizeof(read_path)) {
+                nc_strlcpy(out, "error: path too long", out_cap);
+                return false;
+            }
+        } else {
+            if (!path_is_safe_relative(path)) {
+                nc_strlcpy(out, "error: path traversal not allowed", out_cap);
+                return false;
+            }
+            if (nc_strlcpy(read_path, path, sizeof(read_path)) >= sizeof(read_path)) {
+                nc_strlcpy(out, "error: path too long", out_cap);
+                return false;
+            }
         }
     }
 
     size_t len;
-    char *content = nc_read_file(path, &len);
+    char *content = nc_read_file(read_path, &len);
     if (!content) {
         snprintf(out, out_cap, "error: cannot read file '%s'", path);
         return false;
     }
 
-    size_t cplen = len < out_cap - 1 ? len : out_cap - 1;
-    memcpy(out, content, cplen);
-    out[cplen] = '\0';
+    json_escape(content, len, out, out_cap);
     free(content);
     return true;
 }
@@ -172,16 +436,38 @@ nc_tool nc_tool_file_read(const nc_config *cfg) {
 
 static bool file_write_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
-    char path[1024], content[8192];
+    char path[1024], content[NC_FILE_CONTENT_MAX];
+    char write_path[PATH_MAX];
+    size_t content_len;
+    size_t full_len = 0;
+    nc_extract_status est;
 
-    if (!extract_json_string(args_json, "path", path, sizeof(path))) {
+    est = extract_json_string2(args_json, "path", path, sizeof(path), &full_len);
+    if (est == NC_EXTRACT_INVALID_JSON) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        return false;
+    }
+    if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'path' argument", out_cap);
         return false;
     }
-    if (!extract_json_string(args_json, "content", content, sizeof(content))) {
+    if (est == NC_EXTRACT_TRUNCATED) {
+        snprintf(out, out_cap, "error: 'path' argument too long (%zu bytes, max %zu)",
+                 full_len, sizeof(path) - 1);
+        return false;
+    }
+    est = extract_json_string2(args_json, "content", content, sizeof(content), &full_len);
+    if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'content' argument", out_cap);
         return false;
     }
+    if (est == NC_EXTRACT_TRUNCATED) {
+        snprintf(out, out_cap, "error: 'content' argument too long (%zu bytes, max %zu)",
+                 full_len, sizeof(content) - 1);
+        return false;
+    }
+
+    content_len = strlen(content);
 
     /* Security: workspace scoping */
     if (cfg->workspace_only) {
@@ -189,27 +475,55 @@ static bool file_write_execute(nc_tool *self, const char *args_json, char *out, 
             nc_strlcpy(out, "error: absolute paths not allowed in workspace mode", out_cap);
             return false;
         }
-        char full_path[2048];
-        nc_path_join(full_path, sizeof(full_path), cfg->workspace_dir, path);
-        nc_strlcpy(path, full_path, sizeof(path));
-    }
 
-    /* Check for path traversal (/../ components) */
-    {
-        const char *p = path;
-        while (*p) {
-            if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0')) {
+        if (!path_is_safe_relative(path)) {
+            nc_strlcpy(out, "error: path traversal not allowed", out_cap);
+            return false;
+        }
+
+        if (!nc_path_join(write_path, sizeof(write_path), cfg->workspace_dir, path)) {
+            nc_strlcpy(out, "error: path too long", out_cap);
+            return false;
+        }
+    } else {
+        if (path[0] == '/') {
+            if (nc_strlcpy(write_path, path, sizeof(write_path)) >= sizeof(write_path)) {
+                nc_strlcpy(out, "error: path too long", out_cap);
+                return false;
+            }
+        } else {
+            if (!path_is_safe_relative(path)) {
                 nc_strlcpy(out, "error: path traversal not allowed", out_cap);
                 return false;
             }
-            const char *sl = strchr(p, '/');
-            if (!sl) break;
-            p = sl + 1;
+            if (nc_strlcpy(write_path, path, sizeof(write_path)) >= sizeof(write_path)) {
+                nc_strlcpy(out, "error: path too long", out_cap);
+                return false;
+            }
         }
     }
 
-    if (nc_write_file(path, content, strlen(content))) {
-        snprintf(out, out_cap, "Written %zu bytes to %s", strlen(content), path);
+    {
+        char dirbuf[PATH_MAX];
+        char *slash;
+
+        if (nc_strlcpy(dirbuf, write_path, sizeof(dirbuf)) >= sizeof(dirbuf)) {
+            nc_strlcpy(out, "error: path too long", out_cap);
+            return false;
+        }
+
+        slash = strrchr(dirbuf, '/');
+        if (slash) {
+            *slash = '\0';
+            if (dirbuf[0] != '\0' && !nc_mkdir_p(dirbuf)) {
+                snprintf(out, out_cap, "error: failed to create parent directories for '%s'", path);
+                return false;
+            }
+        }
+    }
+
+    if (nc_write_file(write_path, content, content_len)) {
+        snprintf(out, out_cap, "Written %zu bytes to %s", content_len, write_path);
         return true;
     } else {
         snprintf(out, out_cap, "error: failed to write '%s'", path);
@@ -231,29 +545,837 @@ nc_tool nc_tool_file_write(const nc_config *cfg) {
     };
 }
 
+/* ── Apply patch tool ───────────────────────────────────────────── */
+
+typedef struct {
+    char old_path[PATH_MAX];
+    char new_path[PATH_MAX];
+} patch_target;
+
+static bool path_is_safe_relative(const char *path) {
+    if (!path || !*path)
+        return false;
+
+    if (path[0] == '/')
+        return false;
+
+    if (strstr(path, "../") ||
+        strstr(path, "/..") ||
+        strcmp(path, "..") == 0)
+        return false;
+
+    return true;
+}
+
+static bool unquote_patch_path(const char *src, char *dst, size_t dst_cap)
+{
+    size_t src_len;
+    size_t di = 0;
+    size_t i;
+
+    if (!src || !dst || dst_cap == 0)
+        return false;
+
+    src_len = strlen(src);
+    if (src_len >= 2 && src[0] == '"' && src[src_len - 1] == '"') {
+        src++;
+        src_len -= 2;
+    }
+
+    for (i = 0; i < src_len; i++) {
+        char c = src[i];
+
+        if (c == '\\' && i + 1 < src_len) {
+            i++;
+            c = src[i];
+        }
+
+        if (di + 1 >= dst_cap)
+            return false;
+        dst[di++] = c;
+    }
+
+    dst[di] = '\0';
+    return true;
+}
+
+static bool parse_diff_git_paths(const char *line,
+                                 char *old_path,
+                                 size_t old_cap,
+                                 char *new_path,
+                                 size_t new_cap)
+{
+    const char *p = line;
+    const char *start;
+    char tok1[PATH_MAX * 2];
+    char tok2[PATH_MAX * 2];
+    size_t len = 0;
+    bool quoted;
+
+    if (strncmp(p, "diff --git ", 11) != 0)
+        return false;
+    p += 11;
+
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!*p)
+        return false;
+
+    quoted = (*p == '"');
+    start = p;
+    if (quoted) {
+        p++;
+        while (*p) {
+            if (*p == '"' && p[-1] != '\\') {
+                p++;
+                break;
+            }
+            p++;
+        }
+    } else {
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+    }
+
+    len = (size_t)(p - start);
+    if (len == 0 || len >= sizeof(tok1))
+        return false;
+    memcpy(tok1, start, len);
+    tok1[len] = '\0';
+
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!*p)
+        return false;
+
+    quoted = (*p == '"');
+    start = p;
+    if (quoted) {
+        p++;
+        while (*p) {
+            if (*p == '"' && p[-1] != '\\') {
+                p++;
+                break;
+            }
+            p++;
+        }
+    } else {
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+    }
+
+    len = (size_t)(p - start);
+    if (len == 0 || len >= sizeof(tok2))
+        return false;
+    memcpy(tok2, start, len);
+    tok2[len] = '\0';
+
+    if (!unquote_patch_path(tok1, tok1, sizeof(tok1)) ||
+        !unquote_patch_path(tok2, tok2, sizeof(tok2)))
+        return false;
+
+    if (strcmp(tok1, "/dev/null") == 0) {
+        old_path[0] = '\0';
+    } else {
+        const char *old_src = tok1;
+        if (strncmp(old_src, "a/", 2) == 0)
+            old_src += 2;
+        if (!*old_src || !nc_strlcpy(old_path, old_src, old_cap))
+            return false;
+    }
+
+    if (strcmp(tok2, "/dev/null") == 0) {
+        new_path[0] = '\0';
+    } else {
+        const char *new_src = tok2;
+        if (strncmp(new_src, "b/", 2) == 0)
+            new_src += 2;
+        if (!*new_src || !nc_strlcpy(new_path, new_src, new_cap))
+            return false;
+    }
+
+    return true;
+}
+
+static bool normalize_patch_header_path(const char *src,
+                                        char *dst,
+                                        size_t dst_cap)
+{
+    const char *path = src;
+
+    while (*path == ' ' || *path == '\t')
+        path++;
+
+    if (!*path)
+        return false;
+
+    if (strcmp(path, "/dev/null") == 0) {
+        if (dst_cap == 0)
+            return false;
+        dst[0] = '\0';
+        return true;
+    }
+
+    if ((path[0] == 'a' || path[0] == 'b') && path[1] == '/')
+        path += 2;
+
+    if (!*path)
+        return false;
+
+    return nc_strlcpy(dst, path, dst_cap) < dst_cap;
+}
+
+static bool parse_unified_header_pair(const char *old_line,
+                                      const char *new_line,
+                                      char *old_path,
+                                      size_t old_cap,
+                                      char *new_path,
+                                      size_t new_cap)
+{
+    if (strncmp(old_line, "--- ", 4) != 0 ||
+        strncmp(new_line, "+++ ", 4) != 0)
+        return false;
+
+    if (!normalize_patch_header_path(old_line + 4, old_path, old_cap))
+        return false;
+    if (!normalize_patch_header_path(new_line + 4, new_path, new_cap))
+        return false;
+
+    return true;
+}
+
+static bool validate_patch_path(const char *workspace_root,
+                                const char *relpath)
+{
+    char joined[PATH_MAX];
+    char real_ws[PATH_MAX];
+    char current[PATH_MAX];
+    const char *seg = relpath;
+
+    if (!path_is_safe_relative(relpath))
+        return false;
+
+    if (!realpath(workspace_root, real_ws))
+        return false;
+
+    if (nc_strlcpy(current, real_ws, sizeof(current)) >= sizeof(current))
+        return false;
+
+    while (*seg) {
+        const char *slash = strchr(seg, '/');
+        size_t seg_len = slash ? (size_t)(slash - seg) : strlen(seg);
+        bool is_last = (slash == NULL);
+        char component[NAME_MAX + 1];
+        char resolved[PATH_MAX];
+
+        if (seg_len == 0 || seg_len > NAME_MAX)
+            return false;
+
+        memcpy(component, seg, seg_len);
+        component[seg_len] = '\0';
+
+        if (!strcmp(component, ".") || !strcmp(component, ".."))
+            return false;
+
+        if (!nc_path_join(joined, sizeof(joined), current, component))
+            return false;
+
+        if (access(joined, F_OK) == 0) {
+            if (!realpath(joined, resolved))
+                return false;
+            if (!path_within_workspace(resolved, real_ws))
+                return false;
+            if (nc_strlcpy(current, resolved, sizeof(current)) >= sizeof(current))
+                return false;
+        } else {
+            if (!is_last && errno != ENOENT)
+                return false;
+            if (!is_last)
+                return false;
+        }
+
+        if (!slash)
+            break;
+        seg = slash + 1;
+    }
+
+    return true;
+}
+
+static bool add_patch_target(patch_target *targets,
+                             size_t *count,
+                             size_t max_targets,
+                             const char *old_path,
+                             const char *new_path)
+{
+    if (*count >= max_targets)
+        return false;
+
+    if (old_path) {
+        if (nc_strlcpy(targets[*count].old_path,
+                       old_path,
+                       sizeof(targets[*count].old_path)) >= sizeof(targets[*count].old_path))
+            return false;
+    } else {
+        targets[*count].old_path[0] = '\0';
+    }
+
+    if (new_path) {
+        if (nc_strlcpy(targets[*count].new_path,
+                       new_path,
+                       sizeof(targets[*count].new_path)) >= sizeof(targets[*count].new_path))
+            return false;
+    } else {
+        targets[*count].new_path[0] = '\0';
+    }
+
+    (*count)++;
+    return true;
+}
+
+static bool convert_begin_patch_to_unified(const char *patch,
+                                           char *out,
+                                           size_t out_cap)
+{
+    const char *p = patch;
+    bool saw_begin = false;
+    bool changed = false;
+    size_t out_len = 0;
+
+    if (!patch || !out || out_cap == 0)
+        return false;
+
+    out[0] = '\0';
+
+    while (*p) {
+        size_t len = 0;
+        char line[8192];
+
+        while (p[len] && p[len] != '\n' && len < sizeof(line) - 1)
+            len++;
+
+        if (p[len] != '\0' && p[len] != '\n')
+            return false;
+
+        memcpy(line, p, len);
+        line[len] = '\0';
+
+        if (strcmp(line, "*** Begin Patch") == 0) {
+            saw_begin = true;
+            changed = true;
+        } else if (strcmp(line, "*** End Patch") == 0) {
+            changed = true;
+        } else if (strncmp(line, "*** Update File: ", 17) == 0) {
+            const char *path = line + 17;
+            int n = snprintf(out + out_len,
+                             out_cap - out_len,
+                             "--- a/%s\n+++ b/%s\n",
+                             path,
+                             path);
+            if (n < 0 || (size_t)n >= out_cap - out_len)
+                return false;
+            out_len += (size_t)n;
+            changed = true;
+        } else if (strncmp(line, "*** Add File: ", 14) == 0) {
+            const char *path = line + 14;
+            int n = snprintf(out + out_len,
+                             out_cap - out_len,
+                             "--- /dev/null\n+++ b/%s\n",
+                             path);
+            if (n < 0 || (size_t)n >= out_cap - out_len)
+                return false;
+            out_len += (size_t)n;
+            changed = true;
+        } else if (strncmp(line, "*** Delete File: ", 17) == 0) {
+            const char *path = line + 17;
+            int n = snprintf(out + out_len,
+                             out_cap - out_len,
+                             "--- a/%s\n+++ /dev/null\n",
+                             path);
+            if (n < 0 || (size_t)n >= out_cap - out_len)
+                return false;
+            out_len += (size_t)n;
+            changed = true;
+        } else {
+            if (out_len + len + 2 > out_cap)
+                return false;
+            memcpy(out + out_len, line, len);
+            out_len += len;
+            out[out_len++] = '\n';
+        }
+
+        if (!p[len])
+            break;
+        p += len + 1;
+    }
+
+    if (!changed)
+        return false;
+
+    if (saw_begin && !strstr(patch, "*** End Patch"))
+        return false;
+
+    out[out_len] = '\0';
+    return true;
+}
+
+static bool collect_patch_targets(const char *patch,
+                                  patch_target *targets,
+                                  size_t *count,
+                                  size_t max_targets)
+{
+    char line[8192];
+    char prev_line[8192];
+    bool have_prev_line = false;
+    const char *p = patch;
+
+    *count = 0;
+    prev_line[0] = '\0';
+
+    while (*p) {
+        size_t len = 0;
+        char old_path[PATH_MAX];
+        char new_path[PATH_MAX];
+
+        while (p[len] && p[len] != '\n' && len < sizeof(line) - 1)
+            len++;
+
+        if (p[len] != '\0' && p[len] != '\n')
+            return false;
+
+        memcpy(line, p, len);
+        line[len] = '\0';
+
+        old_path[0] = '\0';
+        new_path[0] = '\0';
+
+        if (parse_diff_git_paths(line,
+                                 old_path,
+                                 sizeof(old_path),
+                                 new_path,
+                                 sizeof(new_path))) {
+            if (!add_patch_target(targets,
+                                  count,
+                                  max_targets,
+                                  old_path[0] ? old_path : NULL,
+                                  new_path[0] ? new_path : NULL))
+                return false;
+        } else if (strncmp(line, "*** Update File: ", 17) == 0) {
+            if (!add_patch_target(targets,
+                                  count,
+                                  max_targets,
+                                  line + 17,
+                                  line + 17))
+                return false;
+        } else if (strncmp(line, "*** Add File: ", 14) == 0) {
+            if (!add_patch_target(targets,
+                                  count,
+                                  max_targets,
+                                  NULL,
+                                  line + 14))
+                return false;
+        } else if (strncmp(line, "*** Delete File: ", 17) == 0) {
+            if (!add_patch_target(targets,
+                                  count,
+                                  max_targets,
+                                  line + 17,
+                                  NULL))
+                return false;
+        } else if (have_prev_line &&
+                   parse_unified_header_pair(prev_line,
+                                             line,
+                                             old_path,
+                                             sizeof(old_path),
+                                             new_path,
+                                             sizeof(new_path))) {
+            if (!add_patch_target(targets,
+                                  count,
+                                  max_targets,
+                                  old_path[0] ? old_path : NULL,
+                                  new_path[0] ? new_path : NULL))
+                return false;
+        }
+
+        if (nc_strlcpy(prev_line, line, sizeof(prev_line)) >= sizeof(prev_line))
+            return false;
+        have_prev_line = true;
+
+        if (!p[len])
+            break;
+
+        p += len + 1;
+    }
+
+    return true;
+}
+
+static bool validate_patch_targets(const char *workspace_root,
+                                   const char *patch_text,
+                                   char *err,
+                                   size_t err_cap)
+{
+    patch_target *targets = NULL;
+    size_t count = 0;
+
+    targets = (patch_target *)calloc(512, sizeof(*targets));
+    if (!targets) {
+        nc_strlcpy(err, "error: out of memory validating patch", err_cap);
+        return false;
+    }
+
+    if (!collect_patch_targets(patch_text, targets, &count, 512)) {
+        nc_strlcpy(err,
+                   "error: invalid patch metadata or too many patch targets",
+                   err_cap);
+        free(targets);
+        return false;
+    }
+
+    if (count == 0) {
+        nc_strlcpy(err, "error: patch contains no file targets", err_cap);
+        free(targets);
+        return false;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (targets[i].old_path[0] &&
+            !validate_patch_path(workspace_root, targets[i].old_path)) {
+            snprintf(err,
+                     err_cap,
+                     "error: invalid patch path '%s'",
+                     targets[i].old_path);
+            free(targets);
+            return false;
+        }
+
+        if (targets[i].new_path[0] &&
+            !validate_patch_path(workspace_root, targets[i].new_path)) {
+            snprintf(err,
+                     err_cap,
+                     "error: invalid patch path '%s'",
+                     targets[i].new_path);
+            free(targets);
+            return false;
+        }
+    }
+
+    free(targets);
+    return true;
+}
+
+static bool run_patch_command(const char *workspace,
+                              const char *patch_file,
+                              char *out,
+                              size_t out_cap,
+                              int *status_out)
+{
+    int pipefd[2];
+    pid_t pid;
+
+    if (pipe(pipefd) != 0) {
+        snprintf(out, out_cap, "error: failed to create pipe: %s", strerror(errno));
+        return false;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        int saved = errno;
+        close(pipefd[0]);
+        close(pipefd[1]);
+        snprintf(out, out_cap, "error: failed to fork patch process: %s", strerror(saved));
+        return false;
+    }
+
+    if (pid == 0) {
+        int patch_fd = open(patch_file, O_RDONLY);
+        if (patch_fd < 0)
+            _exit(127);
+
+        if (dup2(patch_fd, STDIN_FILENO) < 0)
+            _exit(127);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        if (dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(127);
+
+        close(patch_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        execlp("patch",
+               "patch",
+               "-d", workspace,
+               "--batch",
+               "--forward",
+               "-p1",
+               (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    {
+        size_t total = 0;
+        char buf[512];
+        ssize_t nread;
+
+        out[0] = '\0';
+        while ((nread = read(pipefd[0], buf, sizeof(buf))) > 0) {
+            size_t n = (size_t)nread;
+            if (total + n >= out_cap - 1)
+                n = out_cap - 1 - total;
+            memcpy(out + total, buf, n);
+            total += n;
+            if (total >= out_cap - 1) {
+                tool_debug("apply_patch", "patch output truncated to %zu bytes", total);
+                break;
+            }
+        }
+        out[total] = '\0';
+
+        if (nread < 0) {
+            int saved = errno;
+            close(pipefd[0]);
+            waitpid(pid, status_out, 0);
+            snprintf(out, out_cap, "error: failed to read patch output: %s", strerror(saved));
+            return false;
+        }
+
+        if (nread > 0)
+            append_suffix(out, out_cap, "\n[output truncated]");
+    }
+
+    close(pipefd[0]);
+
+    while (waitpid(pid, status_out, 0) < 0) {
+        if (errno != EINTR) {
+            snprintf(out, out_cap, "error: failed to wait for patch: %s", strerror(errno));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool apply_patch_execute(nc_tool *self,
+                                const char *args_json,
+                                char *out,
+                                size_t out_cap)
+{
+    const nc_config *cfg = (const nc_config *)self->ctx;
+    char patch_input[NC_PATCH_INPUT_MAX];
+    size_t patch_full_len = 0;
+    char normalized_patch[NC_PATCH_INPUT_MAX];
+    nc_extract_status patch_st;
+    char workspace[PATH_MAX];
+    char tmp_template[PATH_MAX];
+    int fd;
+
+    tool_debug("apply_patch", "request received");
+
+    if (out_cap == 0)
+        return false;
+    out[0] = '\0';
+
+    patch_st = extract_json_string2(args_json,
+                                    "patch",
+                                    patch_input,
+                                    sizeof(patch_input),
+                                    &patch_full_len);
+    if (patch_st == NC_EXTRACT_INVALID_JSON) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        return false;
+    }
+    if (patch_st == NC_EXTRACT_MISSING) {
+        tool_debug("apply_patch", "missing 'patch' argument");
+        nc_strlcpy(out, "error: missing 'patch' argument", out_cap);
+        return false;
+    }
+    if (patch_st == NC_EXTRACT_EMPTY) {
+        nc_strlcpy(out, "error: empty patch", out_cap);
+        return false;
+    }
+    if (patch_st == NC_EXTRACT_TRUNCATED) {
+        snprintf(out, out_cap,
+                 "error: 'patch' argument too long (%zu bytes, max %zu)",
+                 patch_full_len, sizeof(patch_input) - 1);
+        return false;
+    }
+
+    tool_debug("apply_patch", "patch payload size: %zu bytes", strlen(patch_input));
+    tool_debug_preview("apply_patch", "patch preview", patch_input, strlen(patch_input));
+
+    if (strncmp(patch_input, "*** Begin Patch", 15) == 0) {
+        if (!convert_begin_patch_to_unified(patch_input,
+                                            normalized_patch,
+                                            sizeof(normalized_patch))) {
+            nc_strlcpy(out, "error: invalid Begin Patch format", out_cap);
+            return false;
+        }
+        nc_strlcpy(patch_input, normalized_patch, sizeof(patch_input));
+        tool_debug("apply_patch", "converted Begin Patch format to unified diff");
+        tool_debug_preview("apply_patch", "normalized patch preview", patch_input, strlen(patch_input));
+    }
+
+    if (!cfg->workspace_only) {
+        nc_strlcpy(out,
+                   "error: apply_patch requires workspace mode",
+                   out_cap);
+        return false;
+    }
+
+    if (!realpath(cfg->workspace_dir, workspace)) {
+        tool_debug("apply_patch",
+                   "invalid workspace path '%s': %s",
+                   cfg->workspace_dir,
+                   strerror(errno));
+        nc_strlcpy(out, "error: invalid workspace path", out_cap);
+        return false;
+    }
+
+    tool_debug("apply_patch", "resolved workspace: %s", workspace);
+
+    if (!validate_patch_targets(workspace, patch_input, out, out_cap)) {
+        tool_debug("apply_patch", "patch target validation failed: %s", out);
+        return false;
+    }
+
+    if (snprintf(tmp_template,
+                 sizeof(tmp_template),
+                 "%s/.noclaw_patch_XXXXXX",
+                 workspace) >= (int)sizeof(tmp_template)) {        nc_strlcpy(out, "error: workspace path too long", out_cap);
+        return false;
+    }
+
+    fd = mkstemp(tmp_template);
+    if (fd < 0) {
+        tool_debug("apply_patch",
+                   "failed to create temp patch file '%s': %s",
+                   tmp_template,
+                   strerror(errno));
+        nc_strlcpy(out, "error: failed to create temp patch file", out_cap);
+        return false;
+    }
+    {
+        size_t patch_len = strlen(patch_input);
+        size_t written = 0;
+
+        while (written < patch_len) {
+            ssize_t n = write(fd, patch_input + written, patch_len - written);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                close(fd);
+                unlink(tmp_template);
+                nc_strlcpy(out, "error: failed to write patch", out_cap);
+                return false;
+            }
+            written += (size_t)n;
+        }
+
+        if (patch_len > 0 && patch_input[patch_len - 1] != '\n') {
+            static const char newline = '\n';
+            if (write(fd, &newline, 1) != 1) {
+                close(fd);
+                unlink(tmp_template);
+                nc_strlcpy(out, "error: failed to finalize patch", out_cap);
+                return false;
+            }
+        }
+    }
+
+    if (close(fd) != 0) {
+        unlink(tmp_template);
+        nc_strlcpy(out, "error: failed to finalize patch", out_cap);
+        return false;
+    }
+
+    {
+        int status;
+        if (!run_patch_command(workspace, tmp_template, out, out_cap, &status)) {
+            unlink(tmp_template);
+            return false;
+        }
+
+        if (unlink(tmp_template) != 0)
+            tool_debug("apply_patch", "failed to remove temp patch file '%s': %s", tmp_template, strerror(errno));
+
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            if (!WIFEXITED(status)) {
+                if (WIFSIGNALED(status)) {
+                    char suffix[64];
+                    snprintf(suffix,
+                             sizeof(suffix),
+                             "\n[terminated by signal: %d]",
+                             WTERMSIG(status));
+                    append_suffix(out, out_cap, suffix);
+                } else {
+                    append_suffix(out, out_cap, "\n[process terminated abnormally]");
+                }
+            } else if (WEXITSTATUS(status) == 127 && !out[0]) {
+                nc_strlcpy(out, "error: patch utility not found", out_cap);
+            }
+
+            if (!out[0])
+                nc_strlcpy(out, "error: patch failed", out_cap);
+            return false;
+        }
+    }
+
+    if (!out[0])
+        nc_strlcpy(out, "Patch applied successfully", out_cap);
+
+    tool_debug("apply_patch", "patch applied successfully, output size: %zu bytes", strlen(out));
+    return true;
+}
+
+nc_tool nc_tool_apply_patch(const nc_config *cfg) {
+    return (nc_tool){
+        .def = {
+            .name = "apply_patch",
+            .description = "Apply a unified diff patch.",
+            .parameters_json =
+                "{\"type\":\"object\",\"properties\":{\"patch\":{\"type\":\"string\",\"description\":\"Unified diff patch text\"}},\"required\":[\"patch\"]}",
+        },
+        .ctx = (void *)cfg,
+        .execute = apply_patch_execute,
+        .free = NULL,
+    };
+}
+
 /* ── Memory store tool ────────────────────────────────────────── */
 
 static bool memory_store_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     nc_memory *mem = (nc_memory *)self->ctx;
+
+    tool_debug("memory_store", "request received");
+
     if (!mem) {
+        tool_debug("memory_store", "memory backend not configured");
         nc_strlcpy(out, "error: memory not configured", out_cap);
         return false;
     }
 
     char key[256], content[4096];
     if (!extract_json_string(args_json, "key", key, sizeof(key))) {
+        tool_debug("memory_store", "missing 'key' argument");
         nc_strlcpy(out, "error: missing 'key' argument", out_cap);
         return false;
     }
     if (!extract_json_string(args_json, "content", content, sizeof(content))) {
+        tool_debug("memory_store", "missing 'content' argument for key '%s'", key);
         nc_strlcpy(out, "error: missing 'content' argument", out_cap);
         return false;
     }
 
+    tool_debug("memory_store", "storing key '%s' with %zu bytes", key, strlen(content));
+
     if (mem->store(mem, key, content)) {
+        tool_debug("memory_store", "stored key '%s'", key);
         snprintf(out, out_cap, "Stored memory: %s", key);
         return true;
     }
+    tool_debug("memory_store", "failed to store key '%s'", key);
     nc_strlcpy(out, "error: failed to store memory", out_cap);
     return false;
 }
@@ -276,20 +1398,29 @@ nc_tool nc_tool_memory_store(void *mem_ctx) {
 
 static bool memory_recall_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     nc_memory *mem = (nc_memory *)self->ctx;
+
+    tool_debug("memory_recall", "request received");
+
     if (!mem) {
+        tool_debug("memory_recall", "memory backend not configured");
         nc_strlcpy(out, "error: memory not configured", out_cap);
         return false;
     }
 
     char query[1024];
     if (!extract_json_string(args_json, "query", query, sizeof(query))) {
+        tool_debug("memory_recall", "missing 'query' argument");
         nc_strlcpy(out, "error: missing 'query' argument", out_cap);
         return false;
     }
 
+    tool_debug("memory_recall", "recalling with query: %s", query);
+
     if (mem->recall(mem, query, out, out_cap)) {
+        tool_debug("memory_recall", "recall returned success");
         return true;
     }
+    tool_debug("memory_recall", "no matches found for query: %s", query);
     nc_strlcpy(out, "No matching memories found.", out_cap);
     return true;
 }

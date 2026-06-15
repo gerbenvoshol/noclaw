@@ -28,6 +28,13 @@
 #define NC_CONFIG_FILE   "config.json"
 #define NC_WORKSPACE_DIR "workspace"
 
+#define NC_TOOL_ARGS_MAX     (256 * 1024)
+#define NC_TOOL_RESULT_MAX   (64 * 1024)
+#define NC_SHELL_COMMAND_MAX (64 * 1024)
+#define NC_PATCH_INPUT_MAX   (256 * 1024)
+#define NC_FILE_CONTENT_MAX  (256 * 1024)
+#define NC_LOG_PREVIEW_MAX   160
+
 /* ── Arena allocator ──────────────────────────────────────────── */
 
 #define NC_ARENA_DEFAULT_CAP (64 * 1024)  /* 64 KB default */
@@ -158,6 +165,7 @@ typedef struct nc_config {
     char autonomy_level[32];
     bool workspace_only;
     int  max_actions_per_hour;
+    int  max_iterations;
 
     /* Heartbeat */
     bool heartbeat_enabled;
@@ -197,7 +205,9 @@ void nc_config_apply_env(nc_config *cfg);
 typedef struct nc_tool_call {
     char id[64];           /* "call_abc123" (OpenAI) or "toolu_xxx" (Anthropic) */
     char name[64];         /* function/tool name */
-    char arguments[8192];  /* JSON string of arguments */
+    char arguments[NC_TOOL_ARGS_MAX];  /* JSON string of arguments */
+    size_t arguments_len;              /* original untruncated length */
+    bool arguments_truncated;          /* true if arguments exceeded storage */
 } nc_tool_call;
 
 typedef struct nc_message {
@@ -239,6 +249,7 @@ struct nc_provider {
 /* Provider constructors */
 nc_provider nc_provider_openai(const char *api_key, const char *api_url);
 nc_provider nc_provider_anthropic(const char *api_key, const char *api_url);
+nc_provider nc_provider_gemini(const char *api_key, const char *api_url);
 
 /* ── Channel vtable ───────────────────────────────────────────── */
 
@@ -281,6 +292,8 @@ struct nc_tool {
 
 /* Built-in tools */
 nc_tool nc_tool_shell(const nc_config *cfg);
+nc_tool nc_tool_apply_patch(const nc_config *cfg);
+nc_tool nc_tool_tool_debug(const nc_config *cfg);
 nc_tool nc_tool_file_read(const nc_config *cfg);
 nc_tool nc_tool_file_write(const nc_config *cfg);
 nc_tool nc_tool_memory_store(void *mem_ctx);
@@ -405,6 +418,7 @@ void nc_test_str(void);
 void nc_test_jwriter(void);
 void nc_test_memory(void);
 void nc_test_http(void);
+void nc_test_tools(void);
 #endif
 
 #endif /* NC_H */

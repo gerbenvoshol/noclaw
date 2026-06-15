@@ -1,3 +1,4 @@
+#ifndef NC_TOOLS_TEST
 /*
  * noclaw — The absolute smallest AI assistant. Pure C.
  *
@@ -27,6 +28,7 @@ int main(void) {
     nc_test_config();
     nc_test_memory();
     nc_test_http();
+    nc_test_tools();
 
     printf("\n═════════════════\n");
     printf("Results: %d passed, %d failed\n", nc_test_pass, nc_test_fail);
@@ -114,3 +116,5 @@ int main(int argc, char **argv) {
 }
 
 #endif /* NC_TEST_MAIN */
+
+#endif /* NC_TOOLS_TEST */

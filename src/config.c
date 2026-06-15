@@ -37,6 +37,7 @@ void nc_config_defaults(nc_config *cfg) {
     nc_strlcpy(cfg->autonomy_level, "supervised", sizeof(cfg->autonomy_level));
     cfg->workspace_only = true;
     cfg->max_actions_per_hour = 20;
+    cfg->max_iterations = 50;
 
     /* Heartbeat */
     cfg->heartbeat_enabled = false;
@@ -130,6 +131,8 @@ bool nc_config_load(nc_config *cfg) {
             cfg->workspace_only = nc_json_bool(v, true);
         if ((v = nc_json_get(aut, "max_actions_per_hour")))
             cfg->max_actions_per_hour = (int)nc_json_num(v, 20);
+        if ((v = nc_json_get(aut, "max_iterations")))
+            cfg->max_iterations = (int)nc_json_num(v, 50);
     }
 
     /* Heartbeat section */
@@ -238,10 +241,11 @@ bool nc_config_save(const nc_config *cfg) {
         char tmp[256];
         snprintf(tmp, sizeof(tmp),
             "\n    \"level\": \"%s\",\n    \"workspace_only\": %s,\n"
-            "    \"max_actions_per_hour\": %d\n  }",
+            "    \"max_actions_per_hour\": %d,\n    \"max_iterations\": %d\n  }",
             cfg->autonomy_level,
             cfg->workspace_only ? "true" : "false",
-            cfg->max_actions_per_hour);
+            cfg->max_actions_per_hour,
+            cfg->max_iterations);
         size_t tl = strlen(tmp);
         if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
     }
@@ -295,6 +299,10 @@ void nc_config_apply_env(nc_config *cfg) {
         if (!cfg->api_url[0])
             nc_strlcpy(cfg->api_url, "http://localhost:11434/v1", sizeof(cfg->api_url));
     }
+    else if (strcmp(cfg->default_provider, "gemini") == 0) {
+        if (!cfg->api_url[0])
+            nc_strlcpy(cfg->api_url, "https://generativelanguage.googleapis.com/v1beta/openai", sizeof(cfg->api_url));
+    }
 }
 
 /* ── Tests ──────────────────────────────────────────────────────── */
@@ -310,6 +318,7 @@ void nc_test_config(void) {
     NC_ASSERT(cfg.gateway_require_pairing == true, "config default pairing");
     NC_ASSERT(cfg.gateway_allow_public_bind == false, "config default no public bind");
     NC_ASSERT(cfg.workspace_only == true, "config default workspace_only");
+    NC_ASSERT(cfg.max_iterations == 50, "config default max_iterations");
     NC_ASSERT(cfg.secrets_encrypt == true, "config default secrets encrypt");
     NC_ASSERT(strcmp(cfg.memory_backend, "flat") == 0, "config default memory backend");
     NC_ASSERT(strcmp(cfg.runtime_kind, "native") == 0, "config default runtime");

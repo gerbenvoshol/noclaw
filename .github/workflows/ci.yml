@@ -17,10 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install BearSSL (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libbearssl-dev
+        with:
+          submodules: recursive
 
       - name: Run tests
         run: make test

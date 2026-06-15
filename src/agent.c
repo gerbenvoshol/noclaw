@@ -113,7 +113,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
     agent_push_msg(agent, "user", user_input, NULL, NULL, 0);
 
     const char *tools_json = build_tools_json(agent);
-    int max_iterations = 10;
+    int max_iterations = agent->config->max_iterations > 0 ? agent->config->max_iterations : 100;
 
     for (int iter = 0; iter < max_iterations; iter++) {
         nc_chat_request req = {
@@ -153,13 +153,30 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
         for (int i = 0; i < resp.tool_call_count; i++) {
             nc_tool_call *tc = &resp.tool_calls[i];
 
-            nc_log(NC_LOG_INFO, "  -> %s(%s)", tc->name,
-                   strlen(tc->arguments) > 80 ? "..." : tc->arguments);
+            size_t arg_preview = strlen(tc->arguments);
+            if (arg_preview > NC_LOG_PREVIEW_MAX)
+                arg_preview = NC_LOG_PREVIEW_MAX;
+            nc_log(NC_LOG_INFO, "  -> %s(args=%zu bytes%s): %.*s%s",
+                   tc->name,
+                   tc->arguments_len ? tc->arguments_len : strlen(tc->arguments),
+                   tc->arguments_truncated ? ", truncated" : "",
+                   (int)arg_preview,
+                   tc->arguments,
+                   strlen(tc->arguments) > arg_preview ? "...[truncated for log]" : "");
 
             nc_tool *tool = find_tool(agent, tc->name);
-            char result_buf[8192];
+            char result_buf[NC_TOOL_RESULT_MAX];
 
-            if (tool) {
+            if (tc->arguments_truncated) {
+                snprintf(result_buf, sizeof(result_buf),
+                         "error: tool arguments for '%s' exceeded limit (%zu bytes > %zu bytes) and were not executed",
+                         tc->name,
+                         tc->arguments_len,
+                         sizeof(tc->arguments) - 1);
+                nc_log(NC_LOG_WARN,
+                       "  <- tool %s blocked: arguments truncated (%zu bytes > %zu)",
+                       tc->name, tc->arguments_len, sizeof(tc->arguments) - 1);
+            } else if (tool) {
                 bool ok = tool->execute(tool, tc->arguments, result_buf, sizeof(result_buf));
                 if (!ok) {
                     nc_log(NC_LOG_WARN, "  <- tool %s returned error", tc->name);
