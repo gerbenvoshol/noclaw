@@ -161,6 +161,26 @@ bool nc_config_load(nc_config *cfg) {
             cfg->secrets_encrypt = nc_json_bool(v, true);
     }
 
+    /* Channels */
+    nc_json *channels = nc_json_get(root, "channels");
+    if (channels && channels->type == NC_JSON_OBJECT) {
+        nc_json *telegram = nc_json_get(channels, "telegram");
+        if (telegram && telegram->type == NC_JSON_OBJECT) {
+            if ((v = nc_json_get(telegram, "token")))
+                str_to_buf(cfg->telegram_token, sizeof(cfg->telegram_token), nc_json_str(v, ""));
+        }
+        nc_json *discord = nc_json_get(channels, "discord");
+        if (discord && discord->type == NC_JSON_OBJECT) {
+            if ((v = nc_json_get(discord, "token")))
+                str_to_buf(cfg->discord_token, sizeof(cfg->discord_token), nc_json_str(v, ""));
+        }
+        nc_json *slack = nc_json_get(channels, "slack");
+        if (slack && slack->type == NC_JSON_OBJECT) {
+            if ((v = nc_json_get(slack, "token")))
+                str_to_buf(cfg->slack_token, sizeof(cfg->slack_token), nc_json_str(v, ""));
+        }
+    }
+
     /* Identity */
     nc_json *id = nc_json_get(root, "identity");
     if (id && id->type == NC_JSON_OBJECT) {
@@ -196,7 +216,7 @@ bool nc_config_load(nc_config *cfg) {
 bool nc_config_save(const nc_config *cfg) {
     nc_mkdir_p(cfg->config_dir);
 
-    char buf[4096];
+    char buf[8192];
     nc_jw w;
     nc_jw_init(&w, buf, sizeof(buf));
 
@@ -204,6 +224,8 @@ bool nc_config_save(const nc_config *cfg) {
 
     if (cfg->api_key[0])
         nc_jw_str(&w, "api_key", cfg->api_key);
+    if (cfg->api_url[0])
+        nc_jw_str(&w, "api_url", cfg->api_url);
     nc_jw_str(&w, "default_provider", cfg->default_provider);
     nc_jw_str(&w, "default_model", cfg->default_model);
     nc_jw_num(&w, "default_temperature", cfg->default_temperature);
@@ -218,7 +240,6 @@ bool nc_config_save(const nc_config *cfg) {
             cfg->gateway_port, cfg->gateway_host,
             cfg->gateway_require_pairing ? "true" : "false",
             cfg->gateway_allow_public_bind ? "true" : "false");
-        /* Write raw suffix */
         size_t tl = strlen(tmp);
         if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
     }
@@ -258,6 +279,97 @@ bool nc_config_save(const nc_config *cfg) {
             "\n    \"enabled\": %s,\n    \"interval_minutes\": %d\n  }",
             cfg->heartbeat_enabled ? "true" : "false",
             cfg->heartbeat_interval_minutes);
+        size_t tl = strlen(tmp);
+        if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
+    }
+
+    /* Security */
+    nc_jw_raw(&w, "security", "{");
+    {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp),
+            "\n    \"sandbox\": {\n      \"backend\": \"%s\"\n    }\n  }",
+            cfg->sandbox_backend);
+        size_t tl = strlen(tmp);
+        if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
+    }
+
+    /* Secrets */
+    nc_jw_raw(&w, "secrets", "{");
+    {
+        char tmp[96];
+        snprintf(tmp, sizeof(tmp),
+            "\n    \"encrypt\": %s\n  }",
+            cfg->secrets_encrypt ? "true" : "false");
+        size_t tl = strlen(tmp);
+        if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
+    }
+
+    /* Channels */
+    nc_jw_raw(&w, "channels", "{");
+    {
+        char tmp[1024];
+        int off = snprintf(tmp, sizeof(tmp), "\n");
+        bool first = true;
+        if (cfg->telegram_token[0]) {
+            off += snprintf(tmp + off, sizeof(tmp) - (size_t)off,
+                            "    \"telegram\": { \"token\": \"%s\" }",
+                            cfg->telegram_token);
+            first = false;
+        }
+        if (cfg->discord_token[0] && off < (int)sizeof(tmp)) {
+            off += snprintf(tmp + off, sizeof(tmp) - (size_t)off,
+                            "%s    \"discord\": { \"token\": \"%s\" }",
+                            first ? "" : ",\n",
+                            cfg->discord_token);
+            first = false;
+        }
+        if (cfg->slack_token[0] && off < (int)sizeof(tmp)) {
+            off += snprintf(tmp + off, sizeof(tmp) - (size_t)off,
+                            "%s    \"slack\": { \"token\": \"%s\" }",
+                            first ? "" : ",\n",
+                            cfg->slack_token);
+            first = false;
+        }
+        if (first)
+            off += snprintf(tmp + off, sizeof(tmp) - (size_t)off, "  }");
+        else
+            off += snprintf(tmp + off, sizeof(tmp) - (size_t)off, "\n  }");
+        size_t tl = strlen(tmp);
+        if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
+    }
+
+    /* Identity */
+    nc_jw_raw(&w, "identity", "{");
+    {
+        char tmp[96];
+        snprintf(tmp, sizeof(tmp),
+            "\n    \"format\": \"%s\"\n  }",
+            cfg->identity_format);
+        size_t tl = strlen(tmp);
+        if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
+    }
+
+    /* Runtime */
+    nc_jw_raw(&w, "runtime", "{");
+    {
+        char tmp[96];
+        snprintf(tmp, sizeof(tmp),
+            "\n    \"kind\": \"%s\"\n  }",
+            cfg->runtime_kind);
+        size_t tl = strlen(tmp);
+        if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
+    }
+
+    /* Cost */
+    nc_jw_raw(&w, "cost", "{");
+    {
+        char tmp[192];
+        snprintf(tmp, sizeof(tmp),
+            "\n    \"enabled\": %s,\n    \"daily_limit_usd\": %.2f,\n    \"monthly_limit_usd\": %.2f\n  }",
+            cfg->cost_enabled ? "true" : "false",
+            cfg->cost_daily_limit_usd,
+            cfg->cost_monthly_limit_usd);
         size_t tl = strlen(tmp);
         if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
     }

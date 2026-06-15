@@ -190,11 +190,36 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,
-    "max_actions_per_hour": 20
+    "max_actions_per_hour": 20,
+    "max_iterations": 50
   },
   "heartbeat": {
     "enabled": false,
     "interval_minutes": 30
+  },
+  "security": {
+    "sandbox": {
+      "backend": "auto"
+    }
+  },
+  "secrets": {
+    "encrypt": true
+  },
+  "channels": {
+    "telegram": { "token": "..." },
+    "discord": { "token": "..." },
+    "slack": { "token": "..." }
+  },
+  "identity": {
+    "format": "openclaw"
+  },
+  "runtime": {
+    "kind": "native"
+  },
+  "cost": {
+    "enabled": false,
+    "daily_limit_usd": 10.0,
+    "monthly_limit_usd": 100.0
   }
 }
 ```
