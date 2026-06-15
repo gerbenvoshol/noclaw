@@ -116,6 +116,19 @@ void nc_test_tools(void)
         "apply_patch rejects traversal target");
 
 
+    NC_ASSERT(!ap.execute(&ap,
+        "{\"patch\":\"diff --git a/sub/nohunk.txt b/sub/nohunk.txt\\n--- a/sub/nohunk.txt\\n+++ b/sub/nohunk.txt\\n\"}",
+        out, sizeof(out)),
+        "apply_patch rejects patch with no hunks");
+    NC_ASSERT(strstr(out, "no hunks") != NULL,
+        "apply_patch reports missing hunks");
+
+    NC_ASSERT(!ap.execute(&ap,
+        "{\"patch\":\"*** Begin Patch\\n*** Update File: sub/a.txt\\n@@ -1 +1 @@\\n-hello\\n+hi\\n\"}",
+        out, sizeof(out)),
+        "apply_patch rejects unterminated Begin Patch format");
+
+
     {
         size_t cmd_len = NC_SHELL_COMMAND_MAX + 32;
         char *json = (char *)malloc(cmd_len + 32);

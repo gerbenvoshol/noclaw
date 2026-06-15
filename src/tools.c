@@ -559,6 +559,8 @@ typedef struct {
     char new_path[PATH_MAX];
 } patch_target;
 
+static bool patch_text_has_hunk(const char *patch);
+
 static bool path_is_safe_relative(const char *path) {
     if (!path || !*path)
         return false;
@@ -846,6 +848,7 @@ static bool convert_begin_patch_to_unified(const char *patch,
 {
     const char *p = patch;
     bool saw_begin = false;
+    bool saw_end = false;
     bool changed = false;
     size_t out_len = 0;
 
@@ -871,6 +874,7 @@ static bool convert_begin_patch_to_unified(const char *patch,
             saw_begin = true;
             changed = true;
         } else if (strcmp(line, "*** End Patch") == 0) {
+            saw_end = true;
             changed = true;
         } else if (strncmp(line, "*** Update File: ", 17) == 0) {
             const char *path = line + 17;
@@ -919,11 +923,30 @@ static bool convert_begin_patch_to_unified(const char *patch,
     if (!changed)
         return false;
 
-    if (saw_begin && !strstr(patch, "*** End Patch"))
+    if (saw_begin && !saw_end)
         return false;
 
     out[out_len] = '\0';
     return true;
+}
+
+static bool patch_text_has_hunk(const char *patch)
+{
+    const char *p = patch;
+
+    while (p && *p) {
+        const char *line_end = strchr(p, '\n');
+        size_t len = line_end ? (size_t)(line_end - p) : strlen(p);
+
+        if (len >= 2 && p[0] == '@' && p[1] == '@')
+            return true;
+
+        if (!line_end)
+            break;
+        p = line_end + 1;
+    }
+
+    return false;
 }
 
 static bool collect_patch_targets(const char *patch,
@@ -1044,6 +1067,12 @@ static bool validate_patch_targets(const char *workspace_root,
         return false;
     }
 
+    if (!patch_text_has_hunk(patch_text)) {
+        nc_strlcpy(err, "error: patch contains no hunks", err_cap);
+        free(targets);
+        return false;
+    }
+
     for (size_t i = 0; i < count; i++) {
         if (targets[i].old_path[0] &&
             !validate_patch_path(workspace_root, targets[i].old_path)) {
@@ -1114,6 +1143,8 @@ static bool run_patch_command(const char *workspace,
                "-d", workspace,
                "--batch",
                "--forward",
+               "--reject-file=-",
+               "--posix",
                "-p1",
                (char *)NULL);
         _exit(127);
@@ -1211,6 +1242,11 @@ static bool apply_patch_execute(nc_tool *self,
 
     tool_debug("apply_patch", "patch payload size: %zu bytes", strlen(patch_input));
     tool_debug_preview("apply_patch", "patch preview", patch_input, strlen(patch_input));
+
+    if (patch_input[0] == '\0') {
+        nc_strlcpy(out, "error: empty patch", out_cap);
+        return false;
+    }
 
     if (strncmp(patch_input, "*** Begin Patch", 15) == 0) {
         if (!convert_begin_patch_to_unified(patch_input,
