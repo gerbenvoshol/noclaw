@@ -188,10 +188,69 @@ static void tool_debug_preview(const char *tool,
 
 /* ── Shell tool ───────────────────────────────────────────────── */
 
+static bool shell_command_is_allowed(const char *command, char *reason, size_t reason_cap)
+{
+    const char *blocked[] = {
+        "rm -rf /", "rm -rf /*", "mkfs", "shutdown", "reboot", "halt",
+        "poweroff", "init 0", "init 6", ":(){", "dd if=", "chmod -R /", NULL
+    };
+
+    if (!command || !command[0]) {
+        nc_strlcpy(reason, "empty command", reason_cap);
+        return false;
+    }
+
+    for (int i = 0; blocked[i]; i++) {
+        if (strstr(command, blocked[i])) {
+            snprintf(reason, reason_cap, "blocked pattern: %s", blocked[i]);
+            return false;
+        }
+    }
+
+    for (const unsigned char *p = (const unsigned char *)command; *p; p++) {
+        if ((*p < 0x20 && *p != '\n' && *p != '\r' && *p != '\t') || *p == 0x7f) {
+            nc_strlcpy(reason, "command contains disallowed control characters", reason_cap);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool shell_quote_single(char *dst, size_t dst_cap, const char *src)
+{
+    size_t di = 0;
+
+    if (dst_cap < 3)
+        return false;
+
+    dst[di++] = '\'';
+    for (; *src; src++) {
+        if (*src == '\'') {
+            if (di + 4 >= dst_cap)
+                return false;
+            memcpy(dst + di, "'\\''", 4);
+            di += 4;
+        } else {
+            if (di + 1 >= dst_cap)
+                return false;
+            dst[di++] = *src;
+        }
+    }
+
+    if (di + 2 > dst_cap)
+        return false;
+    dst[di++] = '\'';
+    dst[di] = '\0';
+    return true;
+}
+
 static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
     char command[NC_SHELL_COMMAND_MAX];
-    char shell_cmd[NC_SHELL_COMMAND_MAX + PATH_MAX + 64];
+    char shell_cmd[NC_SHELL_COMMAND_MAX + PATH_MAX * 2 + 128];
+    char quoted_workspace[PATH_MAX * 2 + 8];
+    char block_reason[128];
     size_t full_len = 0;
     nc_extract_status est;
 
@@ -218,6 +277,11 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
 
     if (command[0] == '\0') {
         nc_strlcpy(out, "error: empty command", out_cap);
+        return false;
+    }
+
+    if (!shell_command_is_allowed(command, block_reason, sizeof(block_reason))) {
+        snprintf(out, out_cap, "error: unsafe command rejected (%s)", block_reason);
         return false;
     }
 

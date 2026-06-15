@@ -98,6 +98,20 @@ void nc_test_tools(void)
     NC_ASSERT(strstr(out, "hello") != NULL,
         "shell captures heredoc output");
 
+    NC_ASSERT(!sh.execute(&sh,
+        "{\"command\":\"rm -rf /\"}",
+        out, sizeof(out)),
+        "shell rejects obviously dangerous command");
+    NC_ASSERT(strstr(out, "unsafe command rejected") != NULL,
+        "shell explains unsafe command rejection");
+
+    {
+        char bad_json[64];
+        snprintf(bad_json, sizeof(bad_json), "{\"command\":\"bad%c\"}", 1);
+        NC_ASSERT(!sh.execute(&sh, bad_json, out, sizeof(out)),
+            "shell rejects command with control characters");
+    }
+
     NC_ASSERT(ap.execute(&ap,
         "{\"patch\":\"diff --git a/sub/a.txt b/sub/a.txt\\n--- a/sub/a.txt\\n+++ b/sub/a.txt\\n@@ -1,2 +1,2 @@\\n hello\\n-world\\n+WORLD\\n\"}",
         out, sizeof(out)),
