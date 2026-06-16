@@ -122,7 +122,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
             .model = agent->config->default_model,
             .temperature = agent->config->default_temperature,
             .tools_json = tools_json,
-            .max_tokens = 4096,
+            .max_tokens = agent->config->max_tokens,
         };
 
         nc_chat_response resp;

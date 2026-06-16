@@ -225,12 +225,13 @@ int nc_cmd_onboard(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("noclaw onboard -- quick setup\n\n");
             printf("USAGE:\n");
-            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL]\n\n");
+            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL] [--max-tokens N]\n\n");
             printf("OPTIONS:\n");
             printf("  --provider PROVIDER  openrouter, anthropic, openai, gemini, ollama\n");
             printf("  --api-key KEY        API key for remote providers\n");
             printf("  --base-url URL       OpenAI-compatible base URL\n");
             printf("  --model MODEL        Default model to use\n");
+            printf("  --max-tokens N       Maximum completion tokens per request\n");
             printf("  -h, --help           Show this help\n\n");
             printf("If no provider/api key is passed, onboard runs interactively and asks for setup values.\n");
             return 0;
@@ -242,6 +243,7 @@ int nc_cmd_onboard(int argc, char **argv) {
     const char *provider = NULL;
     const char *base_url = NULL;
     const char *model = NULL;
+    const char *max_tokens = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc)
@@ -252,6 +254,8 @@ int nc_cmd_onboard(int argc, char **argv) {
             base_url = argv[++i];
         else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc)
             model = argv[++i];
+        else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc)
+            max_tokens = argv[++i];
     }
 
     if (provider)
@@ -262,6 +266,11 @@ int nc_cmd_onboard(int argc, char **argv) {
         nc_strlcpy(cfg.api_url, base_url, sizeof(cfg.api_url));
     if (model)
         nc_strlcpy(cfg.default_model, model, sizeof(cfg.default_model));
+    if (max_tokens) {
+        long mt = strtol(max_tokens, NULL, 10);
+        if (mt > 0 && mt <= 10000000L)
+            cfg.max_tokens = (int)mt;
+    }
 
     /* Interactive mode when no provider-related flags were given on the CLI */
     if (!provider && !api_key) {
@@ -307,6 +316,20 @@ int nc_cmd_onboard(int argc, char **argv) {
             if (model_buf[0])
                 nc_strlcpy(cfg.default_model, model_buf, sizeof(cfg.default_model));
         }
+
+
+        printf("Max tokens [%d]: ", cfg.max_tokens);
+        fflush(stdout);
+        char max_tokens_buf[32];
+        if (fgets(max_tokens_buf, sizeof(max_tokens_buf), stdin)) {
+            size_t len = strlen(max_tokens_buf);
+            if (len > 0 && max_tokens_buf[len - 1] == '\n') max_tokens_buf[len - 1] = '\0';
+            if (max_tokens_buf[0]) {
+                long mt = strtol(max_tokens_buf, NULL, 10);
+                if (mt > 0 && mt <= 10000000L)
+                    cfg.max_tokens = (int)mt;
+            }
+        }
     }
 
     /* Ollama defaults */
@@ -327,6 +350,7 @@ int nc_cmd_onboard(int argc, char **argv) {
         printf("Workspace:       %s\n", cfg.workspace_dir);
         printf("Provider:        %s\n", cfg.default_provider);
         printf("Model:           %s\n", cfg.default_model);
+        printf("Max tokens:      %d\n", cfg.max_tokens);
         if (cfg.api_url[0])
             printf("Base URL:        %s\n", cfg.api_url);
         printf("\nRun `noclaw agent` to start chatting!\n");

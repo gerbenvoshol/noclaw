@@ -29,8 +29,8 @@
 #define NC_WORKSPACE_DIR "workspace"
 
 #define NC_TOOL_ARGS_MAX     (256 * 1024)
-#define NC_TOOL_RESULT_MAX   (64 * 1024)
-#define NC_SHELL_COMMAND_MAX (64 * 1024)
+#define NC_TOOL_RESULT_MAX   (256 * 1024)
+#define NC_SHELL_COMMAND_MAX (256 * 1024)
 #define NC_PATCH_INPUT_MAX   (256 * 1024)
 #define NC_FILE_CONTENT_MAX  (256 * 1024)
 #define NC_LOG_PREVIEW_MAX   160
@@ -150,6 +150,7 @@ typedef struct nc_config {
     char default_provider[64];
     char default_model[128];
     double default_temperature;
+    int max_tokens;
 
     /* Gateway */
     char     gateway_host[64];

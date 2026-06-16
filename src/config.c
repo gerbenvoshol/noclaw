@@ -22,6 +22,7 @@ void nc_config_defaults(nc_config *cfg) {
     nc_strlcpy(cfg->default_provider, "openrouter", sizeof(cfg->default_provider));
     nc_strlcpy(cfg->default_model, "anthropic/claude-sonnet-4", sizeof(cfg->default_model));
     cfg->default_temperature = 0.7;
+    cfg->max_tokens = 4096;
 
     /* Gateway */
     nc_strlcpy(cfg->gateway_host, "127.0.0.1", sizeof(cfg->gateway_host));
@@ -99,6 +100,8 @@ bool nc_config_load(nc_config *cfg) {
         str_to_buf(cfg->default_model, sizeof(cfg->default_model), nc_json_str(v, ""));
     if ((v = nc_json_get(root, "default_temperature")))
         cfg->default_temperature = nc_json_num(v, 0.7);
+    if ((v = nc_json_get(root, "max_tokens")))
+        cfg->max_tokens = (int)nc_json_num(v, 4096);
 
     /* Gateway section */
     nc_json *gw = nc_json_get(root, "gateway");
@@ -229,6 +232,7 @@ bool nc_config_save(const nc_config *cfg) {
     nc_jw_str(&w, "default_provider", cfg->default_provider);
     nc_jw_str(&w, "default_model", cfg->default_model);
     nc_jw_num(&w, "default_temperature", cfg->default_temperature);
+    nc_jw_num(&w, "max_tokens", cfg->max_tokens);
 
     /* Gateway */
     nc_jw_raw(&w, "gateway", "{");
@@ -395,6 +399,10 @@ void nc_config_apply_env(nc_config *cfg) {
         double t = strtod(v, &endp);
         if (endp != v && t >= 0.0 && t <= 2.0) cfg->default_temperature = t;
     }
+    if ((v = getenv("NOCLAW_MAX_TOKENS"))) {
+        long mt = strtol(v, NULL, 10);
+        if (mt > 0 && mt <= 10000000L) cfg->max_tokens = (int)mt;
+    }
     if ((v = getenv("NOCLAW_GATEWAY_PORT"))) {
         long p = strtol(v, NULL, 10);
         if (p > 0 && p <= 65535) cfg->gateway_port = (uint16_t)p;
@@ -426,6 +434,7 @@ void nc_test_config(void) {
 
     NC_ASSERT(strcmp(cfg.default_provider, "openrouter") == 0, "config default provider");
     NC_ASSERT(cfg.default_temperature == 0.7, "config default temp");
+    NC_ASSERT(cfg.max_tokens == 4096, "config default max_tokens");
     NC_ASSERT(cfg.gateway_port == 3000, "config default port");
     NC_ASSERT(cfg.gateway_require_pairing == true, "config default pairing");
     NC_ASSERT(cfg.gateway_allow_public_bind == false, "config default no public bind");
