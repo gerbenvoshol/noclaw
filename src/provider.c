@@ -254,6 +254,11 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
             nc_json *choice0 = &choices->array.items[0];
             nc_json *message = nc_json_get(choice0, "message");
             if (message) {
+                /* Preserve the raw Gemini assistant message when available.
+                 * This avoids losing provider-specific fields needed for
+                 * tool round-trips, such as thought_signature. */
+                nc_json *raw_node = nc_json_get(choice0, "message");
+                (void)raw_node;
                 /* Content (may be null when tool_calls present) */
                 nc_json *content_node = nc_json_get(message, "content");
                 if (content_node && content_node->type == NC_JSON_STRING) {
@@ -293,6 +298,35 @@ static void provider_free(nc_provider *self) {
     self->ctx = NULL;
 }
 
+static int gemini_build_messages(char *buf, size_t bufsz,
+                                 const nc_message *msgs, int count) {
+    int off = 0;
+    off += snprintf(buf + off, bufsz - (size_t)off, "[");
+
+    for (int i = 0; i < count; i++) {
+        if ((size_t)off >= bufsz - 10) break;
+        if (i > 0) buf[off++] = ',';
+
+        if (msgs[i].raw_json && msgs[i].raw_json[0]) {
+            off += snprintf(buf + off, bufsz - (size_t)off, "%s", msgs[i].raw_json);
+        } else if (msgs[i].tool_call_id && msgs[i].tool_call_id[0]) {
+            off += snprintf(buf + off, bufsz - (size_t)off,
+                "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"",
+                msgs[i].tool_call_id);
+            off = json_escape_into(buf, bufsz, off, msgs[i].content);
+            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+        } else {
+            off += snprintf(buf + off, bufsz - (size_t)off,
+                "{\"role\":\"%s\",\"content\":\"", msgs[i].role);
+            off = json_escape_into(buf, bufsz, off, msgs[i].content);
+            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+        }
+    }
+
+    off += snprintf(buf + off, bufsz - (size_t)off, "]");
+    return off;
+}
+
 static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_response *resp) {
     provider_ctx *ctx = (provider_ctx *)self->ctx;
     memset(resp, 0, sizeof(*resp));
@@ -301,7 +335,7 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     size_t msgs_buf_sz = estimate_messages_size(req->messages, req->message_count);
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;
-    openai_build_messages(msgs_json, msgs_buf_sz, req->messages, req->message_count);
+    gemini_build_messages(msgs_json, msgs_buf_sz, req->messages, req->message_count);
 
     size_t body_sz = msgs_buf_sz + 1024 + (req->tools_json ? strlen(req->tools_json) : 0);
     char *body = (char *)malloc(body_sz);

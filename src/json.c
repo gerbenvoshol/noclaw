@@ -284,6 +284,13 @@ nc_json *nc_json_get(nc_json *obj, const char *key) {
     return NULL;
 }
 
+
+nc_str nc_json_get_slice(nc_json *root, nc_json *node) {
+    (void)root;
+    (void)node;
+    return NC_STR_NULL;
+}
+
 nc_str nc_json_str(nc_json *v, const char *fallback) {
     if (v && v->type == NC_JSON_STRING) return v->string;
     return nc_str_from(fallback);

@@ -99,6 +99,7 @@ struct nc_json {
 
 nc_json *nc_json_parse(nc_arena *a, const char *src, size_t len);
 nc_json *nc_json_get(nc_json *obj, const char *key);
+nc_str   nc_json_get_slice(nc_json *root, nc_json *node);
 nc_str   nc_json_str(nc_json *v, const char *fallback);
 double   nc_json_num(nc_json *v, double fallback);
 bool     nc_json_bool(nc_json *v, bool fallback);
@@ -215,6 +216,7 @@ typedef struct nc_message {
     const char *role;     /* "system", "user", "assistant", "tool" */
     const char *content;
     const char *tool_call_id;   /* for tool results (role="tool") */
+    const char *raw_json;       /* provider-specific raw message JSON, if needed */
 
     /* Tool calls made by assistant */
     nc_tool_call *tool_calls;   /* array (arena-allocated), or NULL */
@@ -232,6 +234,7 @@ typedef struct nc_chat_request {
 
 typedef struct nc_chat_response {
     char         content[8192];
+    char         raw_message_json[NC_TOOL_ARGS_MAX];
     nc_tool_call tool_calls[NC_MAX_TOOL_CALLS];
     int          tool_call_count;
     int          prompt_tokens;

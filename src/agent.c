@@ -69,7 +69,8 @@ static const char *build_tools_json(nc_agent *agent) {
 
 static void agent_push_msg(nc_agent *agent, const char *role, const char *content,
                            const char *tool_call_id,
-                           const nc_tool_call *tool_calls, int tool_call_count) {
+                           const nc_tool_call *tool_calls, int tool_call_count,
+                           const char *raw_json) {
     if (agent->message_count >= NC_MAX_MESSAGES) {
         /* Compact: keep system + last half of messages */
         int keep = NC_MAX_MESSAGES / 2;
@@ -84,6 +85,9 @@ static void agent_push_msg(nc_agent *agent, const char *role, const char *conten
     msg->content = content ? nc_arena_dup(&agent->arena, content, strlen(content)) : NULL;
     msg->tool_call_id = tool_call_id
         ? nc_arena_dup(&agent->arena, tool_call_id, strlen(tool_call_id))
+        : NULL;
+    msg->raw_json = raw_json
+        ? nc_arena_dup(&agent->arena, raw_json, strlen(raw_json))
         : NULL;
 
     /* Copy tool_calls into arena */
@@ -110,7 +114,7 @@ static nc_tool *find_tool(nc_agent *agent, const char *name) {
 /* ── Chat: single turn (loops for tool calls) ─────────────────── */
 
 const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
-    agent_push_msg(agent, "user", user_input, NULL, NULL, 0);
+    agent_push_msg(agent, "user", user_input, NULL, NULL, 0, NULL);
 
     const char *tools_json = build_tools_json(agent);
     int max_iterations = agent->config->max_iterations > 0 ? agent->config->max_iterations : 100;
@@ -134,7 +138,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
         if (!resp.has_tool_calls) {
             /* Final response — no tool calls */
             const char *reply = nc_arena_dup(&agent->arena, resp.content, strlen(resp.content));
-            agent_push_msg(agent, "assistant", resp.content, NULL, NULL, 0);
+            agent_push_msg(agent, "assistant", resp.content, NULL, NULL, 0, NULL);
             return reply;
         }
 
@@ -147,7 +151,8 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
         agent_push_msg(agent, "assistant",
                        resp.content[0] ? resp.content : NULL,
                        NULL,
-                       resp.tool_calls, resp.tool_call_count);
+                       resp.tool_calls, resp.tool_call_count,
+                       resp.raw_message_json[0] ? resp.raw_message_json : NULL);
 
         /* Execute each tool call and push results */
         for (int i = 0; i < resp.tool_call_count; i++) {
@@ -189,7 +194,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
             }
 
             /* Push tool result message */
-            agent_push_msg(agent, "tool", result_buf, tc->id, NULL, 0);
+            agent_push_msg(agent, "tool", result_buf, tc->id, NULL, 0, NULL);
         }
 
         /* Loop back to provider with the tool results */
