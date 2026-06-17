@@ -42,7 +42,11 @@ static bool jp_consume(jp *p, char c) {
 
 static nc_json *jp_alloc(jp *p) {
     nc_json *v = (nc_json *)nc_arena_alloc(p->arena, sizeof(nc_json));
-    if (v) memset(v, 0, sizeof(*v));
+    if (v) {
+        memset(v, 0, sizeof(*v));
+        v->src = p->src + p->pos;
+        v->src_len = 0;
+    }
     return v;
 }
 
@@ -50,6 +54,10 @@ static nc_json *jp_alloc(jp *p) {
 static nc_json *jp_value(jp *p);
 
 static nc_json *jp_string_val(jp *p) {
+    size_t value_start;
+
+    jp_skip_ws(p);
+    value_start = p->pos;
     if (!jp_consume(p, '"')) return NULL;
 
     size_t start = p->pos;
@@ -68,6 +76,7 @@ static nc_json *jp_string_val(jp *p) {
     nc_json *v = jp_alloc(p);
     if (!v) return NULL;
     v->type = NC_JSON_STRING;
+    v->src = p->src + value_start;
 
     /* Unescape into arena (worst case: same length; \uXXXX expands to <=3 UTF-8 bytes) */
     char *buf = (char *)nc_arena_alloc(p->arena, (end - start) * 3 + 1);
@@ -134,6 +143,7 @@ static nc_json *jp_string_val(jp *p) {
 
     v->string.ptr = buf;
     v->string.len = di;
+    v->src_len = p->pos - value_start;
     return v;
 }
 
@@ -161,11 +171,17 @@ static nc_json *jp_number(jp *p) {
     nc_json *v = jp_alloc(p);
     if (!v) return NULL;
     v->type = NC_JSON_NUMBER;
+    v->src = p->src + start;
+    v->src_len = p->pos - start;
     v->number = strtod(tmp, NULL);
     return v;
 }
 
 static nc_json *jp_array(jp *p) {
+    size_t start;
+
+    jp_skip_ws(p);
+    start = p->pos;
     if (!jp_consume(p, '[')) return NULL;
 
     /* Count-then-parse: first pass count, second parse */
@@ -186,6 +202,8 @@ static nc_json *jp_array(jp *p) {
     nc_json *v = jp_alloc(p);
     if (!v) return NULL;
     v->type = NC_JSON_ARRAY;
+    v->src = p->src + start;
+    v->src_len = p->pos - start;
     v->array.count = count;
     v->array.items = (nc_json *)nc_arena_alloc(p->arena, count * sizeof(nc_json));
     for (int i = 0; i < count; i++)
@@ -194,6 +212,10 @@ static nc_json *jp_array(jp *p) {
 }
 
 static nc_json *jp_object(jp *p) {
+    size_t start;
+
+    jp_skip_ws(p);
+    start = p->pos;
     if (!jp_consume(p, '{')) return NULL;
 
     nc_str  *keys = (nc_str *)nc_arena_alloc(p->arena, 128 * sizeof(nc_str));
@@ -219,6 +241,8 @@ static nc_json *jp_object(jp *p) {
     nc_json *v = jp_alloc(p);
     if (!v) return NULL;
     v->type = NC_JSON_OBJECT;
+    v->src = p->src + start;
+    v->src_len = p->pos - start;
     v->object.count = count;
     v->object.keys = (nc_str *)nc_arena_alloc(p->arena, count * sizeof(nc_str));
     v->object.vals = (nc_json *)nc_arena_alloc(p->arena, count * sizeof(nc_json));
@@ -242,23 +266,32 @@ static nc_json *jp_value(jp *p) {
 
     /* true / false / null */
     if (p->len - p->pos >= 4 && memcmp(p->src + p->pos, "true", 4) == 0) {
+        size_t start = p->pos;
         p->pos += 4;
         nc_json *v = jp_alloc(p);
         v->type = NC_JSON_BOOL;
+        v->src = p->src + start;
+        v->src_len = 4;
         v->boolean = true;
         return v;
     }
     if (p->len - p->pos >= 5 && memcmp(p->src + p->pos, "false", 5) == 0) {
+        size_t start = p->pos;
         p->pos += 5;
         nc_json *v = jp_alloc(p);
         v->type = NC_JSON_BOOL;
+        v->src = p->src + start;
+        v->src_len = 5;
         v->boolean = false;
         return v;
     }
     if (p->len - p->pos >= 4 && memcmp(p->src + p->pos, "null", 4) == 0) {
+        size_t start = p->pos;
         p->pos += 4;
         nc_json *v = jp_alloc(p);
         v->type = NC_JSON_NULL;
+        v->src = p->src + start;
+        v->src_len = 4;
         return v;
     }
 
@@ -287,8 +320,8 @@ nc_json *nc_json_get(nc_json *obj, const char *key) {
 
 nc_str nc_json_get_slice(nc_json *root, nc_json *node) {
     (void)root;
-    (void)node;
-    return NC_STR_NULL;
+    if (!node || !node->src || node->src_len == 0) return NC_STR_NULL;
+    return (nc_str){ .ptr = node->src, .len = node->src_len };
 }
 
 nc_str nc_json_str(nc_json *v, const char *fallback) {
@@ -475,6 +508,15 @@ void nc_test_json(void) {
     const char *j5 = "null";
     nc_json *r5 = nc_json_parse(&a, j5, strlen(j5));
     NC_ASSERT(r5 != NULL && r5->type == NC_JSON_NULL, "json parse null");
+
+    /* Slice tracking */
+    const char *j6 = "{ \"message\": {\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"x\"}]}, \"n\": 1 }";
+    nc_json *r6 = nc_json_parse(&a, j6, strlen(j6));
+    nc_json *m6 = nc_json_get(r6, "message");
+    nc_str s6 = nc_json_get_slice(r6, m6);
+    NC_ASSERT(s6.ptr != NULL && s6.len > 0, "json slice exists");
+    NC_ASSERT(memcmp(s6.ptr, "{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"x\"}]}", s6.len) == 0,
+              "json slice content");
 
     nc_arena_free(&a);
 }

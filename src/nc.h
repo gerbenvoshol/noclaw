@@ -88,6 +88,8 @@ typedef enum {
 typedef struct nc_json nc_json;
 struct nc_json {
     nc_json_type type;
+    const char  *src;
+    size_t       src_len;
     union {
         bool       boolean;
         double     number;

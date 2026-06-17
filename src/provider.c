@@ -254,6 +254,14 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
             nc_json *choice0 = &choices->array.items[0];
             nc_json *message = nc_json_get(choice0, "message");
             if (message) {
+                nc_str raw = nc_json_get_slice(root, message);
+                if (raw.ptr && raw.len > 0) {
+                    size_t cplen = raw.len < sizeof(resp->raw_message_json) - 1
+                        ? raw.len : sizeof(resp->raw_message_json) - 1;
+                    memcpy(resp->raw_message_json, raw.ptr, cplen);
+                    resp->raw_message_json[cplen] = '\0';
+                }
+
                 /* Preserve the raw Gemini assistant message when available.
                  * This avoids losing provider-specific fields needed for
                  * tool round-trips, such as thought_signature. */
@@ -399,6 +407,14 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
             nc_json *choice0 = &choices->array.items[0];
             nc_json *message = nc_json_get(choice0, "message");
             if (message) {
+                nc_str raw = nc_json_get_slice(root, message);
+                if (raw.ptr && raw.len > 0) {
+                    size_t cplen = raw.len < sizeof(resp->raw_message_json) - 1
+                        ? raw.len : sizeof(resp->raw_message_json) - 1;
+                    memcpy(resp->raw_message_json, raw.ptr, cplen);
+                    resp->raw_message_json[cplen] = '\0';
+                }
+
                 nc_json *content_node = nc_json_get(message, "content");
                 if (content_node && content_node->type == NC_JSON_STRING) {
                     nc_str content = content_node->string;
