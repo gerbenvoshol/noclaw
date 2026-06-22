@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 /* ── Shared helpers ───────────────────────────────────────────── */
 
@@ -39,6 +40,20 @@ static int json_escape_into(char *buf, size_t bufsz, int off, const char *s) {
     return off;
 }
 
+/* Safe snprintf append */
+static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ...) {
+    if (bufsz == 0 || (size_t)off >= bufsz - 1) return off;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + off, bufsz - (size_t)off, fmt, args);
+    va_end(args);
+    if (written > 0) {
+        off += written;
+        if ((size_t)off >= bufsz) off = (int)(bufsz - 1);
+    }
+    return off;
+}
+
 /* Compute buffer size needed for messages (generous estimate) */
 static size_t estimate_messages_size(const nc_message *msgs, int count) {
     size_t sz = 512;
@@ -46,6 +61,8 @@ static size_t estimate_messages_size(const nc_message *msgs, int count) {
         sz += 512; /* per-message overhead */
         if (msgs[i].content)
             sz += strlen(msgs[i].content) * 2;
+        if (msgs[i].raw_json)
+            sz += strlen(msgs[i].raw_json);
         /* tool_calls in assistant messages */
         for (int j = 0; j < msgs[i].tool_call_count; j++) {
             sz += 512; /* per-call overhead */
@@ -69,7 +86,7 @@ static size_t estimate_messages_size(const nc_message *msgs, int count) {
 static int openai_build_messages(char *buf, size_t bufsz,
                                  const nc_message *msgs, int count) {
     int off = 0;
-    off += snprintf(buf + off, bufsz - (size_t)off, "[");
+    off = append_snprintf(buf, bufsz, off, "[");
 
     for (int i = 0; i < count; i++) {
         if ((size_t)off >= bufsz - 10) break;
@@ -77,7 +94,7 @@ static int openai_build_messages(char *buf, size_t bufsz,
 
         if (msgs[i].tool_call_count > 0) {
             /* Assistant message with tool_calls */
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"assistant\",\"content\":");
 
             /* content can be null or a string */
@@ -86,41 +103,41 @@ static int openai_build_messages(char *buf, size_t bufsz,
                 off = json_escape_into(buf, bufsz, off, msgs[i].content);
                 buf[off++] = '"';
             } else {
-                off += snprintf(buf + off, bufsz - (size_t)off, "null");
+                off = append_snprintf(buf, bufsz, off, "null");
             }
 
-            off += snprintf(buf + off, bufsz - (size_t)off, ",\"tool_calls\":[");
+            off = append_snprintf(buf, bufsz, off, ",\"tool_calls\":[");
             for (int j = 0; j < msgs[i].tool_call_count; j++) {
                 if (j > 0) buf[off++] = ',';
                 const nc_tool_call *tc = &msgs[i].tool_calls[j];
-                off += snprintf(buf + off, bufsz - (size_t)off,
+                off = append_snprintf(buf, bufsz, off,
                     "{\"id\":\"%s\",\"type\":\"function\","
                     "\"function\":{\"name\":\"%s\",\"arguments\":\"",
                     tc->id, tc->name);
                 /* arguments is a JSON string that must be escaped */
                 off = json_escape_into(buf, bufsz, off, tc->arguments);
-                off += snprintf(buf + off, bufsz - (size_t)off, "\"}}");
+                off = append_snprintf(buf, bufsz, off, "\"}}");
             }
-            off += snprintf(buf + off, bufsz - (size_t)off, "]}");
+            off = append_snprintf(buf, bufsz, off, "]}");
 
         } else if (msgs[i].tool_call_id && msgs[i].tool_call_id[0]) {
             /* Tool result message */
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"",
                 msgs[i].tool_call_id);
             off = json_escape_into(buf, bufsz, off, msgs[i].content);
-            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+            off = append_snprintf(buf, bufsz, off, "\"}");
 
         } else {
             /* Normal message (system/user/assistant) */
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"%s\",\"content\":\"", msgs[i].role);
             off = json_escape_into(buf, bufsz, off, msgs[i].content);
-            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+            off = append_snprintf(buf, bufsz, off, "\"}");
         }
     }
 
-    off += snprintf(buf + off, bufsz - (size_t)off, "]");
+    off = append_snprintf(buf, bufsz, off, "]");
     return off;
 }
 
@@ -309,29 +326,29 @@ static void provider_free(nc_provider *self) {
 static int gemini_build_messages(char *buf, size_t bufsz,
                                  const nc_message *msgs, int count) {
     int off = 0;
-    off += snprintf(buf + off, bufsz - (size_t)off, "[");
+    off = append_snprintf(buf, bufsz, off, "[");
 
     for (int i = 0; i < count; i++) {
         if ((size_t)off >= bufsz - 10) break;
         if (i > 0) buf[off++] = ',';
 
         if (msgs[i].raw_json && msgs[i].raw_json[0]) {
-            off += snprintf(buf + off, bufsz - (size_t)off, "%s", msgs[i].raw_json);
+            off = append_snprintf(buf, bufsz, off, "%s", msgs[i].raw_json);
         } else if (msgs[i].tool_call_id && msgs[i].tool_call_id[0]) {
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"",
                 msgs[i].tool_call_id);
             off = json_escape_into(buf, bufsz, off, msgs[i].content);
-            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+            off = append_snprintf(buf, bufsz, off, "\"}");
         } else {
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"%s\",\"content\":\"", msgs[i].role);
             off = json_escape_into(buf, bufsz, off, msgs[i].content);
-            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+            off = append_snprintf(buf, bufsz, off, "\"}");
         }
     }
 
-    off += snprintf(buf + off, bufsz - (size_t)off, "]");
+    off = append_snprintf(buf, bufsz, off, "]");
     return off;
 }
 
@@ -514,7 +531,7 @@ static const char *anthropic_tools_json_from_defs(char *buf, size_t bufsz,
     }
 
     int off = 0;
-    off += snprintf(buf + off, bufsz - (size_t)off, "[");
+    off = append_snprintf(buf, bufsz, off, "[");
     for (int i = 0; i < arr->array.count; i++) {
         if (i > 0) buf[off++] = ',';
         nc_json *tool = &arr->array.items[i];
@@ -523,7 +540,7 @@ static const char *anthropic_tools_json_from_defs(char *buf, size_t bufsz,
         nc_str name = nc_json_str(nc_json_get(fn, "name"), "");
         nc_str desc = nc_json_str(nc_json_get(fn, "description"), "");
 
-        off += snprintf(buf + off, bufsz - (size_t)off,
+        off = append_snprintf(buf, bufsz, off,
             "{\"name\":\"%.*s\",\"description\":\"%.*s\",\"input_schema\":",
             NC_STR_ARG(name), NC_STR_ARG(desc));
 
@@ -535,7 +552,7 @@ static const char *anthropic_tools_json_from_defs(char *buf, size_t bufsz,
         nc_json *params = nc_json_get(fn, "parameters");
         if (params && params->type == NC_JSON_OBJECT) {
             /* Re-build a minimal JSON object from the parsed structure */
-            off += snprintf(buf + off, bufsz - (size_t)off, "{\"type\":\"object\",\"properties\":{");
+            off = append_snprintf(buf, bufsz, off, "{\"type\":\"object\",\"properties\":{");
             nc_json *props = nc_json_get(params, "properties");
             if (props && props->type == NC_JSON_OBJECT) {
                 for (int k = 0; k < props->object.count; k++) {
@@ -544,31 +561,31 @@ static const char *anthropic_tools_json_from_defs(char *buf, size_t bufsz,
                     nc_json *pval = &props->object.vals[k];
                     nc_str ptype = nc_json_str(nc_json_get(pval, "type"), "string");
                     nc_str pdesc = nc_json_str(nc_json_get(pval, "description"), "");
-                    off += snprintf(buf + off, bufsz - (size_t)off,
+                    off = append_snprintf(buf, bufsz, off,
                         "\"%.*s\":{\"type\":\"%.*s\",\"description\":\"%.*s\"}",
                         NC_STR_ARG(pname), NC_STR_ARG(ptype), NC_STR_ARG(pdesc));
                 }
             }
-            off += snprintf(buf + off, bufsz - (size_t)off, "}");
+            off = append_snprintf(buf, bufsz, off, "}");
             /* required */
             nc_json *req_arr = nc_json_get(params, "required");
             if (req_arr && req_arr->type == NC_JSON_ARRAY && req_arr->array.count > 0) {
-                off += snprintf(buf + off, bufsz - (size_t)off, ",\"required\":[");
+                off = append_snprintf(buf, bufsz, off, ",\"required\":[");
                 for (int k = 0; k < req_arr->array.count; k++) {
                     if (k > 0) buf[off++] = ',';
                     nc_str rname = req_arr->array.items[k].string;
-                    off += snprintf(buf + off, bufsz - (size_t)off, "\"%.*s\"", NC_STR_ARG(rname));
+                    off = append_snprintf(buf, bufsz, off, "\"%.*s\"", NC_STR_ARG(rname));
                 }
-                off += snprintf(buf + off, bufsz - (size_t)off, "]");
+                off = append_snprintf(buf, bufsz, off, "]");
             }
-            off += snprintf(buf + off, bufsz - (size_t)off, "}");
+            off = append_snprintf(buf, bufsz, off, "}");
         } else {
-            off += snprintf(buf + off, bufsz - (size_t)off, "{\"type\":\"object\"}");
+            off = append_snprintf(buf, bufsz, off, "{\"type\":\"object\"}");
         }
 
-        off += snprintf(buf + off, bufsz - (size_t)off, "}");
+        off = append_snprintf(buf, bufsz, off, "}");
     }
-    off += snprintf(buf + off, bufsz - (size_t)off, "]");
+    off = append_snprintf(buf, bufsz, off, "]");
 
     nc_arena_free(&scratch);
     return buf;
@@ -578,7 +595,7 @@ static const char *anthropic_tools_json_from_defs(char *buf, size_t bufsz,
 static int anthropic_build_messages(char *buf, size_t bufsz,
                                     const nc_message *msgs, int count) {
     int off = 0;
-    off += snprintf(buf + off, bufsz - (size_t)off, "[");
+    off = append_snprintf(buf, bufsz, off, "[");
 
     bool first = true;
     for (int i = 0; i < count; i++) {
@@ -590,15 +607,15 @@ static int anthropic_build_messages(char *buf, size_t bufsz,
 
         if (msgs[i].tool_call_count > 0) {
             /* Assistant message with tool_use content blocks */
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"assistant\",\"content\":[");
 
             bool first_block = true;
             /* Text block if content is non-empty */
             if (msgs[i].content && msgs[i].content[0]) {
-                off += snprintf(buf + off, bufsz - (size_t)off, "{\"type\":\"text\",\"text\":\"");
+                off = append_snprintf(buf, bufsz, off, "{\"type\":\"text\",\"text\":\"");
                 off = json_escape_into(buf, bufsz, off, msgs[i].content);
-                off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+                off = append_snprintf(buf, bufsz, off, "\"}");
                 first_block = false;
             }
 
@@ -607,17 +624,17 @@ static int anthropic_build_messages(char *buf, size_t bufsz,
                 if (!first_block) buf[off++] = ',';
                 first_block = false;
                 const nc_tool_call *tc = &msgs[i].tool_calls[j];
-                off += snprintf(buf + off, bufsz - (size_t)off,
+                off = append_snprintf(buf, bufsz, off,
                     "{\"type\":\"tool_use\",\"id\":\"%s\",\"name\":\"%s\",\"input\":%s}",
                     tc->id, tc->name, tc->arguments);
             }
-            off += snprintf(buf + off, bufsz - (size_t)off, "]}");
+            off = append_snprintf(buf, bufsz, off, "]}");
 
         } else if (msgs[i].tool_call_id && msgs[i].tool_call_id[0]) {
             /* Tool result — Anthropic uses role=user with tool_result content blocks.
              * Multiple consecutive tool results should be merged into one user message.
              * Scan ahead to find all consecutive tool results. */
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"user\",\"content\":[");
 
             int j = i;
@@ -625,28 +642,28 @@ static int anthropic_build_messages(char *buf, size_t bufsz,
             while (j < count && msgs[j].tool_call_id && msgs[j].tool_call_id[0]) {
                 if (!first_result) buf[off++] = ',';
                 first_result = false;
-                off += snprintf(buf + off, bufsz - (size_t)off,
+                off = append_snprintf(buf, bufsz, off,
                     "{\"type\":\"tool_result\",\"tool_use_id\":\"%s\",\"content\":\"",
                     msgs[j].tool_call_id);
                 off = json_escape_into(buf, bufsz, off, msgs[j].content);
-                off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+                off = append_snprintf(buf, bufsz, off, "\"}");
                 j++;
             }
             /* Skip the messages we just consumed (outer loop will i++ past them) */
             i = j - 1;
 
-            off += snprintf(buf + off, bufsz - (size_t)off, "]}");
+            off = append_snprintf(buf, bufsz, off, "]}");
 
         } else {
             /* Normal user/assistant message */
-            off += snprintf(buf + off, bufsz - (size_t)off,
+            off = append_snprintf(buf, bufsz, off,
                 "{\"role\":\"%s\",\"content\":\"", msgs[i].role);
             off = json_escape_into(buf, bufsz, off, msgs[i].content);
-            off += snprintf(buf + off, bufsz - (size_t)off, "\"}");
+            off = append_snprintf(buf, bufsz, off, "\"}");
         }
     }
 
-    off += snprintf(buf + off, bufsz - (size_t)off, "]");
+    off = append_snprintf(buf, bufsz, off, "]");
     return off;
 }
 
@@ -696,34 +713,34 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
             if (input && input->type == NC_JSON_OBJECT) {
                 /* Build JSON string from the object */
                 int aoff = 0;
-                aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff, "{");
+                aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "{");
                 for (int k = 0; k < input->object.count; k++) {
                     if (k > 0) out->arguments[aoff++] = ',';
                     nc_str key = input->object.keys[k];
                     nc_json *val = &input->object.vals[k];
-                    aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff,
+                    aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
                         "\"%.*s\":", NC_STR_ARG(key));
                     if (val->type == NC_JSON_STRING) {
-                        aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff,
+                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
                             "\"%.*s\"", NC_STR_ARG(val->string));
                     } else if (val->type == NC_JSON_NUMBER) {
                         if (val->number == (int)val->number)
-                            aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff,
+                            aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
                                 "%d", (int)val->number);
                         else
-                            aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff,
+                            aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
                                 "%.6f", val->number);
                     } else if (val->type == NC_JSON_BOOL) {
-                        aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff,
+                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
                             "%s", val->boolean ? "true" : "false");
                     } else if (val->type == NC_JSON_NULL) {
-                        aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff, "null");
+                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "null");
                     } else {
                         /* Nested objects/arrays: emit as empty for now */
-                        aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff, "null");
+                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "null");
                     }
                 }
-                aoff += snprintf(out->arguments + aoff, sizeof(out->arguments) - (size_t)aoff, "}");
+                aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "}");
             } else {
                 nc_strlcpy(out->arguments, "{}", sizeof(out->arguments));
             }
@@ -760,26 +777,26 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     if (!body) { free(msgs_json); free(tools_buf); return false; }
 
     int off = 0;
-    off += snprintf(body + off, body_sz - (size_t)off,
+    off = append_snprintf(body, body_sz, off,
         "{\"model\":\"%s\",\"max_tokens\":%d,\"temperature\":%.2f,",
         req->model, req->max_tokens > 0 ? req->max_tokens : 4096, req->temperature);
 
     /* System message (Anthropic puts it at top level, not in messages) */
     for (int i = 0; i < req->message_count; i++) {
         if (strcmp(req->messages[i].role, "system") == 0 && req->messages[i].content) {
-            off += snprintf(body + off, body_sz - (size_t)off, "\"system\":\"");
+            off = append_snprintf(body, body_sz, off, "\"system\":\"");
             off = json_escape_into(body, body_sz, off, req->messages[i].content);
-            off += snprintf(body + off, body_sz - (size_t)off, "\",");
+            off = append_snprintf(body, body_sz, off, "\",");
             break;
         }
     }
 
     /* Tools */
     if (tools_buf)
-        off += snprintf(body + off, body_sz - (size_t)off, "\"tools\":%s,", tools_buf);
+        off = append_snprintf(body, body_sz, off, "\"tools\":%s,", tools_buf);
 
     /* Messages */
-    off += snprintf(body + off, body_sz - (size_t)off, "\"messages\":%s}", msgs_json);
+    off = append_snprintf(body, body_sz, off, "\"messages\":%s}", msgs_json);
 
     /* Headers */
     char auth_hdr[300];

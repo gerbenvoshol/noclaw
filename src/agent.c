@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 /* ── Init / Free ──────────────────────────────────────────────── */
 
@@ -40,6 +41,20 @@ void nc_agent_init(nc_agent *agent, nc_config *cfg, nc_provider *prov,
     agent->message_count = 1;
 }
 
+/* Safe snprintf append */
+static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ...) {
+    if (bufsz == 0 || (size_t)off >= bufsz - 1) return off;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + off, bufsz - (size_t)off, fmt, args);
+    va_end(args);
+    if (written > 0) {
+        off += written;
+        if ((size_t)off >= bufsz) off = (int)(bufsz - 1);
+    }
+    return off;
+}
+
 /* ── Build tools JSON for the provider ────────────────────────── */
 
 static const char *build_tools_json(nc_agent *agent) {
@@ -50,18 +65,18 @@ static const char *build_tools_json(nc_agent *agent) {
     char *buf = (char *)nc_arena_alloc(&agent->arena, bufsz);
     if (!buf) return NULL;
     int off = 0;
-    off += snprintf(buf + off, bufsz - (size_t)off, "[");
+    off = append_snprintf(buf, bufsz, off, "[");
 
     for (int i = 0; i < agent->tool_count; i++) {
-        if (i > 0) off += snprintf(buf + off, bufsz - (size_t)off, ",");
-        off += snprintf(buf + off, bufsz - (size_t)off,
+        if (i > 0) off = append_snprintf(buf, bufsz, off, ",");
+        off = append_snprintf(buf, bufsz, off,
             "{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":%s}}",
             agent->tools[i].def.name,
             agent->tools[i].def.description,
             agent->tools[i].def.parameters_json);
     }
 
-    off += snprintf(buf + off, bufsz - (size_t)off, "]");
+    off = append_snprintf(buf, bufsz, off, "]");
     return buf;
 }
 
