@@ -218,6 +218,7 @@ typedef struct { int score; const char *key; size_t klen; const char *content; s
 static bool flat_recall(nc_memory *self, const char *query, char *out, size_t out_cap) {
     flat_mem *ctx = (flat_mem *)self->ctx;
     if (!ctx) return false;
+    if (out_cap == 0) return false;
 
     size_t flen = 0;
     char *data = read_all(ctx->path, &flen);
@@ -298,15 +299,14 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
         content_buf[cl] = '\0';
         flat_unescape(content_buf);
 
-        if (off >= out_cap) break;
-        int n = snprintf(out + off, out_cap - off, "[%s] %s\n", key_buf, content_buf);
-        if (n < 0) break;
-        if ((size_t)n >= out_cap - off) {
-            off = out_cap - 1;
-            out[off] = '\0';
-        } else {
-            off += (size_t)n;
-        }
+        char line_buf[9216];
+        int n = snprintf(line_buf, sizeof(line_buf), "[%s] %s\n", key_buf, content_buf);
+        if (n < 0) continue;
+        size_t line_len = (size_t)n < sizeof(line_buf) ? (size_t)n : sizeof(line_buf) - 1;
+        if (off > out_cap || line_len > out_cap - off - 1) break;
+        memcpy(out + off, line_buf, line_len);
+        off += line_len;
+        out[off] = '\0';
         count++;
     }
 

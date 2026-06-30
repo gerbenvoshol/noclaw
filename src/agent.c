@@ -236,30 +236,30 @@ static nc_tool *find_tool(nc_agent *agent, const char *name) {
         if (strcmp(agent->tools[i].def.name, name) == 0)
             return &agent->tools[i];
     }
-
-    static uint64_t fnv1a64_update(uint64_t h, const char *s) {
-        if (!s) return h;
-        while (*s) {
-            h ^= (unsigned char)*s++;
-            h *= 1099511628211ULL;
-        }
-        return h;
-    }
-
-    static uint64_t tool_round_hash(const nc_tool_call *calls, int count) {
-        uint64_t h = 1469598103934665603ULL;
-        for (int i = 0; i < count; i++) {
-            h = fnv1a64_update(h, calls[i].id);
-            h = fnv1a64_update(h, calls[i].name);
-            h = fnv1a64_update(h, calls[i].arguments);
-            h ^= (uint64_t)calls[i].arguments_len;
-            h *= 1099511628211ULL;
-            h ^= (uint64_t)calls[i].arguments_truncated;
-            h *= 1099511628211ULL;
-        }
-        return h;
-    }
     return NULL;
+}
+
+static uint64_t fnv1a64_update(uint64_t h, const char *s) {
+    if (!s) return h;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t tool_round_hash(const nc_tool_call *calls, int count) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < count; i++) {
+        h = fnv1a64_update(h, calls[i].id);
+        h = fnv1a64_update(h, calls[i].name);
+        h = fnv1a64_update(h, calls[i].arguments);
+        h ^= (uint64_t)calls[i].arguments_len;
+        h *= 1099511628211ULL;
+        h ^= (uint64_t)calls[i].arguments_truncated;
+        h *= 1099511628211ULL;
+    }
+    return h;
 }
 
 /* ── Chat: single turn (loops for tool calls) ─────────────────── */
