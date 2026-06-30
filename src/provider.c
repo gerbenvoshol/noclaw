@@ -223,7 +223,9 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     /* Direct OpenAI API uses max_completion_tokens (max_tokens is deprecated/removed
      * on newer models such as o1/o3/o4). All other OpenAI-compatible providers
      * (OpenRouter, Ollama, LM Studio, etc.) still use max_tokens.
-     * Match the full scheme+host prefix to avoid subdomain spoofing. */
+     * Match the full scheme+host prefix to avoid subdomain spoofing.
+     * This covers https://api.openai.com, https://api.openai.com/v1, and any
+     * other path under that host. */
     static const char openai_prefix[] = "https://api.openai.com";
     bool direct_openai = (strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0);
     const char *tokens_key = direct_openai ? "max_completion_tokens" : "max_tokens";

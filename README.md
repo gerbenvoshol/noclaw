@@ -230,7 +230,7 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
 
 **`default_temperature`** is optional. When omitted, the provider uses its own default. Valid range is `0.0`–`2.0`. Can also be set via `NOCLAW_TEMPERATURE`.
 
-**`max_tokens`** controls the maximum number of output tokens per request. noclaw maps this to the correct API parameter based on the endpoint: requests to `https://api.openai.com` use `max_completion_tokens` (required by newer OpenAI models like o1/o3/o4); all other endpoints (OpenRouter, Anthropic, Gemini, Ollama, etc.) use `max_tokens`. When you set `provider: openai`, the API URL defaults to `https://api.openai.com/v1` automatically. Can also be set via `NOCLAW_MAX_TOKENS`.
+**`max_tokens`** controls the maximum number of output tokens per request. noclaw maps this to the correct API parameter based on the endpoint: requests to `https://api.openai.com` (or any path under it, such as `/v1`) use `max_completion_tokens` (required by newer OpenAI models like o1/o3/o4); all other endpoints (OpenRouter, Anthropic, Gemini, Ollama, etc.) use `max_tokens`. When you set `provider: openai`, the API URL defaults to `https://api.openai.com/v1` automatically. Can also be set via `NOCLAW_MAX_TOKENS`.
 
 > **Note on providers:** Use `provider: openrouter` for OpenRouter (routes to any model), or `provider: openai` to talk to the OpenAI API directly. Direct OpenAI is required for models like o1/o3/o4 that only accept `max_completion_tokens`.
 
