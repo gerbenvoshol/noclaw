@@ -16,6 +16,9 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#define NC_FNV1A64_OFFSET_BASIS 1469598103934665603ULL
+#define NC_FNV1A64_PRIME        1099511628211ULL
+
 /* ── Init / Free ──────────────────────────────────────────────── */
 
 void nc_agent_init(nc_agent *agent, nc_config *cfg, nc_provider *prov,
@@ -245,22 +248,22 @@ static uint64_t fnv1a64_update(uint64_t h, const char *s) {
     if (!s) return h;
     while (*s) {
         h ^= (unsigned char)*s++;
-        h *= 1099511628211ULL;
+        h *= NC_FNV1A64_PRIME;
     }
     return h;
 }
 
 static uint64_t tool_round_hash(const nc_tool_call *calls, int count) {
     /* Standard FNV-1a 64-bit offset basis. */
-    uint64_t h = 1469598103934665603ULL;
+    uint64_t h = NC_FNV1A64_OFFSET_BASIS;
     for (int i = 0; i < count; i++) {
         h = fnv1a64_update(h, calls[i].id);
         h = fnv1a64_update(h, calls[i].name);
         h = fnv1a64_update(h, calls[i].arguments);
         h ^= (uint64_t)calls[i].arguments_len;
-        h *= 1099511628211ULL;
+        h *= NC_FNV1A64_PRIME;
         h ^= (uint64_t)calls[i].arguments_truncated;
-        h *= 1099511628211ULL;
+        h *= NC_FNV1A64_PRIME;
     }
     return h;
 }
@@ -341,7 +344,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
             const char *tool_call_id = tc->id;
 
             if (!tool_call_id || !tool_call_id[0]) {
-                /* 1-based ids are easier to read in user-facing logs. */
+                /* 1-based IDs are easier to read in user-facing logs. */
                 snprintf(fallback_tool_call_id, sizeof(fallback_tool_call_id),
                          "call_iter%d_%d", iter + 1, i + 1);
                 tool_call_id = fallback_tool_call_id;

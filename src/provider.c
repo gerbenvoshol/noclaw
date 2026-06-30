@@ -165,7 +165,7 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
             memcpy(out->id, id.ptr, cl);
             out->id[cl] = '\0';
         }
-        /* 1-based fallback ids improve readability in logs/debugging output. */
+        /* 1-based fallback IDs improve readability in logs/debugging output. */
         if (!out->id[0])
             snprintf(out->id, sizeof(out->id), "call_%d", resp->tool_call_count + 1);
 
@@ -746,7 +746,7 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
                 memcpy(out->id, id.ptr, cl);
                 out->id[cl] = '\0';
             }
-            /* 1-based fallback ids improve readability in logs/debugging output. */
+            /* 1-based fallback IDs improve readability in logs/debugging output. */
             if (!out->id[0])
                 snprintf(out->id, sizeof(out->id), "toolu_%d", resp->tool_call_count + 1);
 
