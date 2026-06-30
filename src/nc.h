@@ -33,6 +33,7 @@
 #define NC_SHELL_COMMAND_MAX (256 * 1024)
 #define NC_PATCH_INPUT_MAX   (256 * 1024)
 #define NC_FILE_CONTENT_MAX  (256 * 1024)
+#define NC_RESPONSE_CONTENT_MAX 16384
 #define NC_LOG_PREVIEW_MAX   160
 
 /* ── Arena allocator ──────────────────────────────────────────── */
@@ -235,7 +236,7 @@ typedef struct nc_chat_request {
 } nc_chat_request;
 
 typedef struct nc_chat_response {
-    char         content[8192];
+    char         content[NC_RESPONSE_CONTENT_MAX];
     char         raw_message_json[NC_TOOL_ARGS_MAX];
     nc_tool_call tool_calls[NC_MAX_TOOL_CALLS];
     int          tool_call_count;
@@ -324,7 +325,7 @@ nc_memory nc_memory_flat(const char *path);
 
 /* ── Agent ────────────────────────────────────────────────────── */
 
-#define NC_MAX_MESSAGES 128
+#define NC_MAX_MESSAGES 256
 
 typedef struct nc_agent {
     nc_config   *config;
