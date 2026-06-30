@@ -225,6 +225,10 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
 }
 ```
 
+**`default_temperature`** is optional. When omitted, the provider uses its own default. Valid range is `0.0`–`2.0`. Can also be set via `NOCLAW_TEMPERATURE`.
+
+**`max_tokens`** controls the maximum number of output tokens per request (sent as `max_tokens` to all providers). Can also be set via `NOCLAW_MAX_TOKENS`.
+
 For local models, omit `api_key` and set `api_url` instead:
 
 ```json
