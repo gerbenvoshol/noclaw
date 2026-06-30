@@ -104,7 +104,8 @@ static void agent_compact_messages(nc_agent *agent) {
     int start = total - keep;
     if (start < 1) start = 1; /* never drop system message */
 
-    /* Allocate scratch storage on the heap for messages we're keeping */
+    /* Allocate scratch storage on the heap for messages we're keeping.
+     * scratch[0] = system message, scratch[1..keep] = the `keep` kept messages. */
     nc_msg_scratch *scratch = (nc_msg_scratch *)calloc(
         (size_t)(keep + 1), sizeof(nc_msg_scratch));
     if (!scratch) {
@@ -119,22 +120,39 @@ static void agent_compact_messages(nc_agent *agent) {
     }
 
     /* Save system message (index 0) */
+    if (agent->messages[0].role == NULL)
+        nc_log(NC_LOG_WARN, "Session compaction: system message has NULL role");
     nc_strlcpy(scratch[0].role,
                agent->messages[0].role ? agent->messages[0].role : "system",
                sizeof(scratch[0].role));
-    scratch[0].content = agent->messages[0].content
-                       ? strdup(agent->messages[0].content) : NULL;
+    if (agent->messages[0].content) {
+        scratch[0].content = strdup(agent->messages[0].content);
+        if (!scratch[0].content)
+            nc_log(NC_LOG_WARN, "Session compaction: strdup failed for system content");
+    }
     /* system message has no tool_call_id / raw_json / tool_calls */
 
-    /* Save kept messages */
+    /* Save messages at indices [start .. start+keep-1] into scratch[1..keep] */
     for (int i = 0; i < keep; i++) {
         const nc_message *m = &agent->messages[start + i];
         nc_strlcpy(scratch[i + 1].role,
                    m->role ? m->role : "user",
                    sizeof(scratch[i + 1].role));
-        scratch[i + 1].content      = m->content      ? strdup(m->content)      : NULL;
-        scratch[i + 1].tool_call_id = m->tool_call_id ? strdup(m->tool_call_id) : NULL;
-        scratch[i + 1].raw_json     = m->raw_json     ? strdup(m->raw_json)     : NULL;
+        if (m->content) {
+            scratch[i + 1].content = strdup(m->content);
+            if (!scratch[i + 1].content)
+                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for message content (msg %d)", i);
+        }
+        if (m->tool_call_id) {
+            scratch[i + 1].tool_call_id = strdup(m->tool_call_id);
+            if (!scratch[i + 1].tool_call_id)
+                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for tool_call_id (msg %d)", i);
+        }
+        if (m->raw_json) {
+            scratch[i + 1].raw_json = strdup(m->raw_json);
+            if (!scratch[i + 1].raw_json)
+                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for raw_json (msg %d)", i);
+        }
         scratch[i + 1].tool_call_count = m->tool_call_count;
         if (m->tool_calls && m->tool_call_count > 0) {
             scratch[i + 1].tool_calls = (nc_tool_call *)malloc(
@@ -143,6 +161,7 @@ static void agent_compact_messages(nc_agent *agent) {
                 memcpy(scratch[i + 1].tool_calls, m->tool_calls,
                        (size_t)m->tool_call_count * sizeof(nc_tool_call));
             } else {
+                nc_log(NC_LOG_WARN, "Session compaction: malloc failed for tool_calls (msg %d)", i);
                 scratch[i + 1].tool_call_count = 0;
             }
         }
@@ -152,8 +171,9 @@ static void agent_compact_messages(nc_agent *agent) {
     nc_arena_reset(&agent->arena);
     agent->message_count = 0;
 
-    /* Re-push all kept messages from scratch into the fresh arena */
-    for (int i = 0; i < keep + 1; i++) {
+    /* Re-push all keep+1 saved messages (system + kept) into the fresh arena.
+     * scratch has exactly keep+1 elements: indices 0..keep inclusive. */
+    for (int i = 0; i <= keep; i++) {
         agent_push_msg(agent,
                        scratch[i].role,
                        scratch[i].content,
