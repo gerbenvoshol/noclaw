@@ -239,6 +239,8 @@ static nc_tool *find_tool(nc_agent *agent, const char *name) {
     return NULL;
 }
 
+/* Tool-loop guard hash: we hash each tool-call round and stop if identical
+ * rounds repeat several times, which prevents infinite tool-call cycles. */
 static uint64_t fnv1a64_update(uint64_t h, const char *s) {
     if (!s) return h;
     while (*s) {

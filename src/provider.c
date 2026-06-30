@@ -166,7 +166,7 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
             out->id[cl] = '\0';
         }
         if (!out->id[0])
-            snprintf(out->id, sizeof(out->id), "call_%d", i + 1);
+            snprintf(out->id, sizeof(out->id), "call_%d", resp->tool_call_count + 1);
 
         nc_str name = nc_json_str(nc_json_get(fn, "name"), "");
         if (name.len > 0) {
@@ -740,7 +740,7 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
                 out->id[cl] = '\0';
             }
             if (!out->id[0])
-                snprintf(out->id, sizeof(out->id), "toolu_%d", i + 1);
+                snprintf(out->id, sizeof(out->id), "toolu_%d", resp->tool_call_count + 1);
 
             nc_str name = nc_json_str(nc_json_get(block, "name"), "");
             if (name.len > 0) {

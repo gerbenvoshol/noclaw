@@ -20,6 +20,8 @@ typedef struct {
     char path[512];
 } flat_mem;
 
+#define NC_RECALL_LINE_MAX 9216
+
 /* ── Flat-file escape/unescape (tab and newline break the format) ── */
 
 static void flat_escape(const char *in, char *out, size_t out_cap) {
@@ -299,7 +301,7 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
         content_buf[cl] = '\0';
         flat_unescape(content_buf);
 
-        char line_buf[9216];
+        char line_buf[NC_RECALL_LINE_MAX];
         int n = snprintf(line_buf, sizeof(line_buf), "[%s] %s\n", key_buf, content_buf);
         if (n < 0) continue;
         size_t line_len = (size_t)n < sizeof(line_buf) ? (size_t)n : sizeof(line_buf) - 1;
