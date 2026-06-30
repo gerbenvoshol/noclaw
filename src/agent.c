@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 /* ── Init / Free ──────────────────────────────────────────────── */
 
@@ -235,6 +236,29 @@ static nc_tool *find_tool(nc_agent *agent, const char *name) {
         if (strcmp(agent->tools[i].def.name, name) == 0)
             return &agent->tools[i];
     }
+
+    static uint64_t fnv1a64_update(uint64_t h, const char *s) {
+        if (!s) return h;
+        while (*s) {
+            h ^= (unsigned char)*s++;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    static uint64_t tool_round_hash(const nc_tool_call *calls, int count) {
+        uint64_t h = 1469598103934665603ULL;
+        for (int i = 0; i < count; i++) {
+            h = fnv1a64_update(h, calls[i].id);
+            h = fnv1a64_update(h, calls[i].name);
+            h = fnv1a64_update(h, calls[i].arguments);
+            h ^= (uint64_t)calls[i].arguments_len;
+            h *= 1099511628211ULL;
+            h ^= (uint64_t)calls[i].arguments_truncated;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
     return NULL;
 }
 
@@ -245,6 +269,8 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
 
     const char *tools_json = build_tools_json(agent);
     int max_iterations = agent->config->max_iterations > 0 ? agent->config->max_iterations : 100;
+    uint64_t prev_tool_hash = 0;
+    int repeat_tool_rounds = 0;
 
     for (int iter = 0; iter < max_iterations; iter++) {
         nc_chat_request req = {
@@ -269,6 +295,30 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
             return reply;
         }
 
+        if (resp.tool_call_count <= 0) {
+            nc_log(NC_LOG_WARN, "Provider indicated tool calls but returned none; ending loop");
+            static const char loop_guard_msg[] =
+                "I couldn't continue because tool-call metadata was incomplete.";
+            return nc_arena_dup(&agent->arena, loop_guard_msg, sizeof(loop_guard_msg) - 1);
+        }
+
+        {
+            uint64_t h = tool_round_hash(resp.tool_calls, resp.tool_call_count);
+            if (iter > 0 && h == prev_tool_hash)
+                repeat_tool_rounds++;
+            else
+                repeat_tool_rounds = 0;
+            prev_tool_hash = h;
+
+            if (repeat_tool_rounds >= 2) {
+                nc_log(NC_LOG_WARN, "Detected repeated tool-call loop; ending after %d repeated rounds",
+                       repeat_tool_rounds + 1);
+                static const char repeat_msg[] =
+                    "I stopped because the model repeated the same tool calls without progress.";
+                return nc_arena_dup(&agent->arena, repeat_msg, sizeof(repeat_msg) - 1);
+            }
+        }
+
         /* ── Tool call dispatch ───────────────────────────────── */
 
         nc_log(NC_LOG_INFO, "Tool calls: %d (iteration %d/%d)",
@@ -284,6 +334,16 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
         /* Execute each tool call and push results */
         for (int i = 0; i < resp.tool_call_count; i++) {
             nc_tool_call *tc = &resp.tool_calls[i];
+            char fallback_tool_call_id[64];
+            const char *tool_call_id = tc->id;
+
+            if (!tool_call_id || !tool_call_id[0]) {
+                snprintf(fallback_tool_call_id, sizeof(fallback_tool_call_id),
+                         "call_iter%d_%d", iter + 1, i + 1);
+                tool_call_id = fallback_tool_call_id;
+                nc_log(NC_LOG_WARN, "  -> tool call '%s' missing id; using fallback id '%s'",
+                       tc->name, tool_call_id);
+            }
 
             size_t arg_preview = strlen(tc->arguments);
             if (arg_preview > NC_LOG_PREVIEW_MAX)
@@ -321,7 +381,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
             }
 
             /* Push tool result message */
-            agent_push_msg(agent, "tool", result_buf, tc->id, NULL, 0, NULL);
+            agent_push_msg(agent, "tool", result_buf, tool_call_id, NULL, 0, NULL);
         }
 
         /* Loop back to provider with the tool results */

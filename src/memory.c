@@ -12,6 +12,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <strings.h>
+#include <stdint.h>
 
 /* ── Flat-file context ───────────────────────────────────────── */
 
@@ -147,13 +148,18 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
     flat_escape(key, esc_key, sizeof(esc_key));
     flat_escape(content, esc_content, sizeof(esc_content));
     size_t eklen = strlen(esc_key);
+    size_t eclen = strlen(esc_content);
 
     /* Read existing file */
     size_t flen = 0;
     char *data = read_all(ctx->path, &flen);
 
     /* Build new file: replace line with matching key, or append */
-    size_t new_cap = flen + eklen + strlen(esc_content) + 64;
+    if (flen > SIZE_MAX - eklen - eclen - 128) {
+        free(data);
+        return false;
+    }
+    size_t new_cap = flen + eklen + eclen + 128;
     char *out = (char *)malloc(new_cap);
     if (!out) { free(data); return false; }
 
@@ -173,6 +179,11 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
             }
 
             if (!skip && llen > 0) {
+                if (out_len > new_cap || llen > new_cap - out_len - 1) {
+                    free(out);
+                    free(data);
+                    return false;
+                }
                 memcpy(out + out_len, line, llen);
                 out_len += llen;
                 out[out_len++] = '\n';
@@ -186,7 +197,12 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
     /* Append the new/updated entry (escaped) */
     int n = snprintf(out + out_len, new_cap - out_len, "%s\t%s\t%ld\n",
                      esc_key, esc_content, (long)now);
-    if (n > 0) out_len += (size_t)n;
+    if (n < 0 || (size_t)n >= new_cap - out_len) {
+        free(out);
+        free(data);
+        return false;
+    }
+    out_len += (size_t)n;
 
     bool ok = write_all(ctx->path, out, out_len);
 
@@ -282,8 +298,15 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
         content_buf[cl] = '\0';
         flat_unescape(content_buf);
 
+        if (off >= out_cap) break;
         int n = snprintf(out + off, out_cap - off, "[%s] %s\n", key_buf, content_buf);
-        if (n > 0) off += (size_t)n;
+        if (n < 0) break;
+        if ((size_t)n >= out_cap - off) {
+            off = out_cap - 1;
+            out[off] = '\0';
+        } else {
+            off += (size_t)n;
+        }
         count++;
     }
 
@@ -455,6 +478,15 @@ void nc_test_memory(void) {
 
     ok = mem.recall(&mem, "C language", buf, sizeof(buf));
     NC_ASSERT(ok, "recall multiple C results");
+
+    {
+        char small[32];
+        memset(small, 'x', sizeof(small));
+        small[sizeof(small) - 1] = '\0';
+        ok = mem.recall(&mem, "C", small, sizeof(small));
+        NC_ASSERT(ok, "recall works with small output buffers");
+        NC_ASSERT(small[sizeof(small) - 1] == '\0', "small recall buffer remains null-terminated");
+    }
 
     /* Free */
     mem.free(&mem);

@@ -51,6 +51,12 @@ static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ..
         off += written;
         if ((size_t)off >= bufsz) off = (int)(bufsz - 1);
     }
+
+    static bool json_array_complete(const char *s) {
+        if (!s) return false;
+        size_t n = strlen(s);
+        return n >= 2 && s[0] == '[' && s[n - 1] == ']';
+    }
     return off;
 }
 
@@ -151,6 +157,7 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
         if (!fn) continue;
 
         nc_tool_call *out = &resp->tool_calls[resp->tool_call_count];
+        memset(out, 0, sizeof(*out));
 
         nc_str id = nc_json_str(nc_json_get(tc, "id"), "");
         if (id.len > 0) {
@@ -158,6 +165,8 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
             memcpy(out->id, id.ptr, cl);
             out->id[cl] = '\0';
         }
+        if (!out->id[0])
+            snprintf(out->id, sizeof(out->id), "call_%d", resp->tool_call_count + 1);
 
         nc_str name = nc_json_str(nc_json_get(fn, "name"), "");
         if (name.len > 0) {
@@ -189,13 +198,21 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     memset(resp, 0, sizeof(*resp));
 
     /* Build messages JSON */
-    size_t msgs_buf_sz = estimate_messages_size(req->messages, req->message_count);
+    size_t msgs_est = estimate_messages_size(req->messages, req->message_count);
+    if (msgs_est > (SIZE_MAX - 4096) / 2) return false;
+    size_t msgs_buf_sz = msgs_est * 2 + 4096;
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;
     openai_build_messages(msgs_json, msgs_buf_sz, req->messages, req->message_count);
+    if (!json_array_complete(msgs_json)) {
+        nc_log(NC_LOG_ERROR, "OpenAI messages JSON was truncated");
+        free(msgs_json);
+        return false;
+    }
 
     /* Build request body */
-    size_t body_sz = msgs_buf_sz + 1024 + (req->tools_json ? strlen(req->tools_json) : 0);
+    size_t body_sz = strlen(msgs_json) + strlen(req->model) + 2048 +
+                     (req->tools_json ? strlen(req->tools_json) : 0);
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); return false; }
 
@@ -223,6 +240,12 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
             template,
             req->model, msgs_json, req->temperature,
             req->max_tokens > 0 ? req->max_tokens : 4096);
+    }
+    if (body_len < 0 || (size_t)body_len >= body_sz) {
+        nc_log(NC_LOG_ERROR, "OpenAI request body exceeded buffer");
+        free(msgs_json);
+        free(body);
+        return false;
     }
 
     /* Headers */
@@ -361,12 +384,20 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     memset(resp, 0, sizeof(*resp));
 
     /* Gemini OpenAI compatibility endpoint. */
-    size_t msgs_buf_sz = estimate_messages_size(req->messages, req->message_count);
+    size_t msgs_est = estimate_messages_size(req->messages, req->message_count);
+    if (msgs_est > (SIZE_MAX - 4096) / 2) return false;
+    size_t msgs_buf_sz = msgs_est * 2 + 4096;
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;
     gemini_build_messages(msgs_json, msgs_buf_sz, req->messages, req->message_count);
+    if (!json_array_complete(msgs_json)) {
+        nc_log(NC_LOG_ERROR, "Gemini messages JSON was truncated");
+        free(msgs_json);
+        return false;
+    }
 
-    size_t body_sz = msgs_buf_sz + 1024 + (req->tools_json ? strlen(req->tools_json) : 0);
+    size_t body_sz = strlen(msgs_json) + strlen(req->model) + 2048 +
+                     (req->tools_json ? strlen(req->tools_json) : 0);
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); return false; }
 
@@ -382,6 +413,12 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
             "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d}",
             req->model, msgs_json, req->temperature,
             req->max_tokens > 0 ? req->max_tokens : 4096);
+    }
+    if (body_len < 0 || (size_t)body_len >= body_sz) {
+        nc_log(NC_LOG_ERROR, "Gemini request body exceeded buffer");
+        free(msgs_json);
+        free(body);
+        return false;
     }
 
     const char *headers[2];
@@ -694,6 +731,7 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
         }
         else if (nc_str_eql(btype, "tool_use") && resp->tool_call_count < NC_MAX_TOOL_CALLS) {
             nc_tool_call *out = &resp->tool_calls[resp->tool_call_count];
+            memset(out, 0, sizeof(*out));
 
             nc_str id = nc_json_str(nc_json_get(block, "id"), "");
             if (id.len > 0) {
@@ -701,6 +739,8 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
                 memcpy(out->id, id.ptr, cl);
                 out->id[cl] = '\0';
             }
+            if (!out->id[0])
+                snprintf(out->id, sizeof(out->id), "toolu_%d", resp->tool_call_count + 1);
 
             nc_str name = nc_json_str(nc_json_get(block, "name"), "");
             if (name.len > 0) {
@@ -739,10 +779,17 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     memset(resp, 0, sizeof(*resp));
 
     /* Build messages JSON (Anthropic format) */
-    size_t msgs_buf_sz = estimate_messages_size(req->messages, req->message_count);
+    size_t msgs_est = estimate_messages_size(req->messages, req->message_count);
+    if (msgs_est > (SIZE_MAX - 4096) / 2) return false;
+    size_t msgs_buf_sz = msgs_est * 2 + 4096;
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;
     anthropic_build_messages(msgs_json, msgs_buf_sz, req->messages, req->message_count);
+    if (!json_array_complete(msgs_json)) {
+        nc_log(NC_LOG_ERROR, "Anthropic messages JSON was truncated");
+        free(msgs_json);
+        return false;
+    }
 
     /* Build tools JSON (Anthropic format: input_schema) */
     char *tools_buf = NULL;
@@ -754,7 +801,8 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     }
 
     /* Build request body */
-    size_t body_sz = msgs_buf_sz + 2048 + (tools_buf ? strlen(tools_buf) : 0);
+    size_t body_sz = strlen(msgs_json) + strlen(req->model) + 3072 +
+                     (tools_buf ? strlen(tools_buf) : 0);
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); free(tools_buf); return false; }
 
@@ -779,6 +827,13 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
 
     /* Messages */
     off = append_snprintf(body, body_sz, off, "\"messages\":%s}", msgs_json);
+    if ((size_t)off >= body_sz - 1) {
+        nc_log(NC_LOG_ERROR, "Anthropic request body exceeded buffer");
+        free(msgs_json);
+        free(tools_buf);
+        free(body);
+        return false;
+    }
 
     /* Headers */
     char auth_hdr[300];
