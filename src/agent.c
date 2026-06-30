@@ -80,18 +80,130 @@ static const char *build_tools_json(nc_agent *agent) {
     return buf;
 }
 
-/* ── Add message to history ───────────────────────────────────── */
+/* Forward declaration — agent_push_msg is defined below agent_compact_messages */
+static void agent_push_msg(nc_agent *agent, const char *role, const char *content,
+                           const char *tool_call_id,
+                           const nc_tool_call *tool_calls, int tool_call_count,
+                           const char *raw_json);
+
+/* ── Compact message history, resetting the arena ────────────── */
+
+/* Scratch copy of a message for arena-safe compaction. */
+typedef struct {
+    char  role[32];
+    char *content;       /* malloc'd, or NULL */
+    char *tool_call_id;  /* malloc'd, or NULL */
+    char *raw_json;      /* malloc'd, or NULL */
+    nc_tool_call *tool_calls; /* malloc'd array, or NULL */
+    int   tool_call_count;
+} nc_msg_scratch;
+
+static void agent_compact_messages(nc_agent *agent) {
+    /* keep = NC_MAX_MESSAGES/2 is always >= 1 (NC_MAX_MESSAGES is a positive compile-time constant),
+     * so (keep + 1) is always positive and safe to cast to size_t. */
+    int keep  = NC_MAX_MESSAGES / 2;
+    int total = agent->message_count;
+    int start = total - keep;
+    if (start < 1) start = 1; /* never drop system message */
+
+    /* Allocate scratch storage on the heap for messages we're keeping.
+     * scratch[0] = system message, scratch[1..keep] = the `keep` kept messages. */
+    nc_msg_scratch *scratch = (nc_msg_scratch *)calloc(
+        (size_t)(keep + 1), sizeof(nc_msg_scratch));
+    if (!scratch) {
+        /* Fallback: memmove without arena reset (no crash, but arena leaks) */
+        memmove(&agent->messages[1], &agent->messages[start],
+                (size_t)keep * sizeof(nc_message));
+        agent->message_count = 1 + keep;
+        nc_log(NC_LOG_WARN,
+               "Session compaction: alloc failed, arena not reset (%d messages kept)",
+               keep);
+        return;
+    }
+
+    /* Save system message (index 0).  If role is somehow NULL we fall back to "system"
+     * and log a warning; the fallback is safe because nc_strlcpy handles it. */
+    if (agent->messages[0].role == NULL)
+        nc_log(NC_LOG_WARN, "Session compaction: system message has NULL role");
+    nc_strlcpy(scratch[0].role,
+               agent->messages[0].role ? agent->messages[0].role : "system",
+               sizeof(scratch[0].role));
+    if (agent->messages[0].content) {
+        scratch[0].content = strdup(agent->messages[0].content);
+        if (!scratch[0].content)
+            nc_log(NC_LOG_WARN, "Session compaction: strdup failed for system content");
+    }
+    /* system message has no tool_call_id / raw_json / tool_calls */
+
+    /* Save messages at indices [start .. start+keep-1] into scratch[1..keep] */
+    for (int i = 0; i < keep; i++) {
+        const nc_message *m = &agent->messages[start + i];
+        nc_strlcpy(scratch[i + 1].role,
+                   m->role ? m->role : "user",
+                   sizeof(scratch[i + 1].role));
+        if (m->content) {
+            scratch[i + 1].content = strdup(m->content);
+            if (!scratch[i + 1].content)
+                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for message content (msg %d)", i);
+        }
+        if (m->tool_call_id) {
+            scratch[i + 1].tool_call_id = strdup(m->tool_call_id);
+            if (!scratch[i + 1].tool_call_id)
+                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for tool_call_id (msg %d)", i);
+        }
+        if (m->raw_json) {
+            scratch[i + 1].raw_json = strdup(m->raw_json);
+            if (!scratch[i + 1].raw_json)
+                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for raw_json (msg %d)", i);
+        }
+        scratch[i + 1].tool_call_count = m->tool_call_count;
+        if (m->tool_calls && m->tool_call_count > 0) {
+            scratch[i + 1].tool_calls = (nc_tool_call *)malloc(
+                (size_t)m->tool_call_count * sizeof(nc_tool_call));
+            if (scratch[i + 1].tool_calls) {
+                memcpy(scratch[i + 1].tool_calls, m->tool_calls,
+                       (size_t)m->tool_call_count * sizeof(nc_tool_call));
+            } else {
+                nc_log(NC_LOG_WARN, "Session compaction: malloc failed for tool_calls (msg %d)", i);
+                scratch[i + 1].tool_call_count = 0;
+            }
+        }
+    }
+
+    /* Reset the arena — all arena-allocated string pointers are now invalid */
+    nc_arena_reset(&agent->arena);
+    agent->message_count = 0;
+
+    /* Re-push all keep+1 saved messages (system + kept) into the fresh arena.
+     * scratch has exactly keep+1 elements: indices 0..keep inclusive. */
+    for (int i = 0; i <= keep; i++) {
+        agent_push_msg(agent,
+                       scratch[i].role,
+                       scratch[i].content,
+                       scratch[i].tool_call_id,
+                       scratch[i].tool_calls,
+                       scratch[i].tool_call_count,
+                       scratch[i].raw_json);
+        free(scratch[i].content);
+        free(scratch[i].tool_call_id);
+        free(scratch[i].raw_json);
+        free(scratch[i].tool_calls);
+    }
+    free(scratch);
+
+    nc_log(NC_LOG_INFO,
+           "Session compacted: kept %d/%d messages, arena reset",
+           keep, total);
+}
+
+
 
 static void agent_push_msg(nc_agent *agent, const char *role, const char *content,
                            const char *tool_call_id,
                            const nc_tool_call *tool_calls, int tool_call_count,
                            const char *raw_json) {
     if (agent->message_count >= NC_MAX_MESSAGES) {
-        /* Compact: keep system + last half of messages */
-        int keep = NC_MAX_MESSAGES / 2;
-        memmove(&agent->messages[1], &agent->messages[agent->message_count - keep],
-                (size_t)keep * sizeof(nc_message));
-        agent->message_count = 1 + keep;
+        agent_compact_messages(agent);
     }
 
     nc_message *msg = &agent->messages[agent->message_count++];

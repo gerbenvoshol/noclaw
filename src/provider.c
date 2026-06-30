@@ -166,12 +166,16 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
             out->name[cl] = '\0';
         }
 
-        /* arguments is a JSON string (already escaped in the response) */
+        /* arguments is a JSON string (already unescaped by the parser) */
         nc_str args = nc_json_str(nc_json_get(fn, "arguments"), "{}");
-        if (args.len > 0) {
-            size_t cl = args.len < sizeof(out->arguments) - 1 ? args.len : sizeof(out->arguments) - 1;
-            memcpy(out->arguments, args.ptr, cl);
-            out->arguments[cl] = '\0';
+        {
+            size_t cl = args.len < sizeof(out->arguments) - 1
+                        ? args.len : sizeof(out->arguments) - 1;
+            if (cl > 0 && args.ptr)
+                memcpy(out->arguments, args.ptr, cl);
+            out->arguments[cl]       = '\0';
+            out->arguments_len       = args.len;
+            out->arguments_truncated = (cl < args.len);
         }
 
         resp->tool_call_count++;
@@ -705,44 +709,22 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
                 out->name[cl] = '\0';
             }
 
-            /* input is a JSON object — we need to serialize it back to a string.
-             * Since our JSON lib doesn't have a generic serializer, we find the raw
-             * substring in the response body. We store it as-is from the input field.
-             * For now, re-build a minimal JSON from the parsed object. */
+            /* input is a JSON object — copy the raw source text from the response body.
+             * This preserves nested objects, arrays, and correctly-escaped strings
+             * without any re-serialization loss.  input->src points into http_resp.body
+             * which remains alive until nc_http_response_free() is called. */
             nc_json *input = nc_json_get(block, "input");
-            if (input && input->type == NC_JSON_OBJECT) {
-                /* Build JSON string from the object */
-                int aoff = 0;
-                aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "{");
-                for (int k = 0; k < input->object.count; k++) {
-                    if (k > 0) out->arguments[aoff++] = ',';
-                    nc_str key = input->object.keys[k];
-                    nc_json *val = &input->object.vals[k];
-                    aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
-                        "\"%.*s\":", NC_STR_ARG(key));
-                    if (val->type == NC_JSON_STRING) {
-                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
-                            "\"%.*s\"", NC_STR_ARG(val->string));
-                    } else if (val->type == NC_JSON_NUMBER) {
-                        if (val->number == (int)val->number)
-                            aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
-                                "%d", (int)val->number);
-                        else
-                            aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
-                                "%.6f", val->number);
-                    } else if (val->type == NC_JSON_BOOL) {
-                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff,
-                            "%s", val->boolean ? "true" : "false");
-                    } else if (val->type == NC_JSON_NULL) {
-                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "null");
-                    } else {
-                        /* Nested objects/arrays: emit as empty for now */
-                        aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "null");
-                    }
-                }
-                aoff = append_snprintf(out->arguments, sizeof(out->arguments), aoff, "}");
+            if (input && input->src && input->src_len > 0) {
+                size_t cl = input->src_len < sizeof(out->arguments) - 1
+                            ? input->src_len : sizeof(out->arguments) - 1;
+                memcpy(out->arguments, input->src, cl);
+                out->arguments[cl] = '\0';
+                out->arguments_len = input->src_len;
+                out->arguments_truncated = (cl < input->src_len);
             } else {
                 nc_strlcpy(out->arguments, "{}", sizeof(out->arguments));
+                out->arguments_len = 2;
+                out->arguments_truncated = false;
             }
 
             resp->tool_call_count++;

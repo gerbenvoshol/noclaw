@@ -185,15 +185,15 @@ static nc_json *jp_array(jp *p) {
     if (!jp_consume(p, '[')) return NULL;
 
     /* Count-then-parse: first pass count, second parse */
-    /* Simpler: dynamic with arena, max 256 items */
-    nc_json **items = (nc_json **)nc_arena_alloc(p->arena, 256 * sizeof(nc_json *));
+    /* Simpler: dynamic with arena, max 1024 items */
+    nc_json **items = (nc_json **)nc_arena_alloc(p->arena, 1024 * sizeof(nc_json *));
     if (!items) return NULL;
     int count = 0;
 
     if (jp_peek(p) != ']') {
         do {
             nc_json *item = jp_value(p);
-            if (item && count < 256)
+            if (item && count < 1024)
                 items[count++] = item;
         } while (jp_consume(p, ','));
     }
@@ -218,8 +218,8 @@ static nc_json *jp_object(jp *p) {
     start = p->pos;
     if (!jp_consume(p, '{')) return NULL;
 
-    nc_str  *keys = (nc_str *)nc_arena_alloc(p->arena, 128 * sizeof(nc_str));
-    nc_json **vals = (nc_json **)nc_arena_alloc(p->arena, 128 * sizeof(nc_json *));
+    nc_str  *keys = (nc_str *)nc_arena_alloc(p->arena, 512 * sizeof(nc_str));
+    nc_json **vals = (nc_json **)nc_arena_alloc(p->arena, 512 * sizeof(nc_json *));
     if (!keys || !vals) return NULL;
     int count = 0;
 
@@ -229,7 +229,7 @@ static nc_json *jp_object(jp *p) {
             if (!k) break;
             if (!jp_consume(p, ':')) break;
             nc_json *val = jp_value(p);
-            if (val && count < 128) {
+            if (val && count < 512) {
                 keys[count] = k->string;
                 vals[count] = val;
                 count++;
