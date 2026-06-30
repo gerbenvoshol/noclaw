@@ -420,6 +420,10 @@ void nc_config_apply_env(nc_config *cfg) {
         if (!cfg->api_url[0])
             nc_strlcpy(cfg->api_url, "http://localhost:11434/v1", sizeof(cfg->api_url));
     }
+    else if (strcmp(cfg->default_provider, "openai") == 0) {
+        if (!cfg->api_url[0])
+            nc_strlcpy(cfg->api_url, "https://api.openai.com/v1", sizeof(cfg->api_url));
+    }
     else if (strcmp(cfg->default_provider, "gemini") == 0) {
         if (!cfg->api_url[0])
             nc_strlcpy(cfg->api_url, "https://generativelanguage.googleapis.com/v1beta/openai", sizeof(cfg->api_url));

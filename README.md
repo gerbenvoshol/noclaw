@@ -50,8 +50,11 @@ git clone --recurse-submodules https://github.com/noclaw/noclaw.git
 cd noclaw
 make release
 
-# Setup (cloud)
+# Setup (cloud — OpenRouter)
 ./noclaw onboard --api-key sk-... --provider openrouter
+
+# Setup (direct OpenAI — uses max_completion_tokens for newer models)
+./noclaw onboard --api-key sk-... --provider openai --model gpt-4o
 
 # Setup (local — ollama, no API key needed)
 ./noclaw onboard --provider ollama --model llama3.2
@@ -227,7 +230,9 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
 
 **`default_temperature`** is optional. When omitted, the provider uses its own default. Valid range is `0.0`–`2.0`. Can also be set via `NOCLAW_TEMPERATURE`.
 
-**`max_tokens`** controls the maximum number of output tokens per request (sent as `max_tokens` to all providers). Can also be set via `NOCLAW_MAX_TOKENS`.
+**`max_tokens`** controls the maximum number of output tokens per request. noclaw maps this to the correct API parameter per provider: `max_completion_tokens` for direct OpenAI (`provider: openai`), and `max_tokens` for all other providers (OpenRouter, Anthropic, Gemini, Ollama, etc.). Can also be set via `NOCLAW_MAX_TOKENS`.
+
+> **Note on providers:** Use `provider: openrouter` for OpenRouter (routes to any model), or `provider: openai` to talk to the OpenAI API directly. Direct OpenAI is required for models like o1/o3/o4 that only accept `max_completion_tokens`.
 
 For local models, omit `api_key` and set `api_url` instead:
 

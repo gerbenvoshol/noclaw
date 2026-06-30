@@ -220,13 +220,19 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); return false; }
 
+    /* Direct OpenAI API uses max_completion_tokens (max_tokens is deprecated/removed
+     * on newer models such as o1/o3/o4). All other OpenAI-compatible providers
+     * (OpenRouter, Ollama, LM Studio, etc.) still use max_tokens. */
+    bool direct_openai = (strstr(ctx->api_url, "api.openai.com") != NULL);
+    const char *tokens_key = direct_openai ? "max_completion_tokens" : "max_tokens";
+
     int off = 0;
     off = append_snprintf(body, body_sz, off,
         "{\"model\":\"%s\",\"messages\":%s", req->model, msgs_json);
     if (req->temperature >= 0.0)
         off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
-    off = append_snprintf(body, body_sz, off, ",\"max_tokens\":%d",
-        req->max_tokens > 0 ? req->max_tokens : 4096);
+    off = append_snprintf(body, body_sz, off, ",\"%s\":%d",
+        tokens_key, req->max_tokens > 0 ? req->max_tokens : 4096);
     if (req->tools_json)
         off = append_snprintf(body, body_sz, off, ",\"tools\":%s", req->tools_json);
     off = append_snprintf(body, body_sz, off, "}");
