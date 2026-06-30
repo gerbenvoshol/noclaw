@@ -222,8 +222,10 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     /* Direct OpenAI API uses max_completion_tokens (max_tokens is deprecated/removed
      * on newer models such as o1/o3/o4). All other OpenAI-compatible providers
-     * (OpenRouter, Ollama, LM Studio, etc.) still use max_tokens. */
-    bool direct_openai = (strstr(ctx->api_url, "api.openai.com") != NULL);
+     * (OpenRouter, Ollama, LM Studio, etc.) still use max_tokens.
+     * Match the full scheme+host prefix to avoid subdomain spoofing. */
+    static const char openai_prefix[] = "https://api.openai.com";
+    bool direct_openai = (strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0);
     const char *tokens_key = direct_openai ? "max_completion_tokens" : "max_tokens";
 
     int off = 0;
@@ -815,24 +817,23 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
         req->model, req->max_tokens > 0 ? req->max_tokens : 4096);
     if (req->temperature >= 0.0)
         off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
-    off = append_snprintf(body, body_sz, off, ",");
 
     /* System message (Anthropic puts it at top level, not in messages) */
     for (int i = 0; i < req->message_count; i++) {
         if (strcmp(req->messages[i].role, "system") == 0 && req->messages[i].content) {
-            off = append_snprintf(body, body_sz, off, "\"system\":\"");
+            off = append_snprintf(body, body_sz, off, ",\"system\":\"");
             off = json_escape_into(body, body_sz, off, req->messages[i].content);
-            off = append_snprintf(body, body_sz, off, "\",");
+            off = append_snprintf(body, body_sz, off, "\"");
             break;
         }
     }
 
     /* Tools */
     if (tools_buf)
-        off = append_snprintf(body, body_sz, off, "\"tools\":%s,", tools_buf);
+        off = append_snprintf(body, body_sz, off, ",\"tools\":%s", tools_buf);
 
-    /* Messages */
-    off = append_snprintf(body, body_sz, off, "\"messages\":%s}", msgs_json);
+    /* Messages — always the last field */
+    off = append_snprintf(body, body_sz, off, ",\"messages\":%s}", msgs_json);
     if ((size_t)off >= body_sz - 1) {
         nc_log(NC_LOG_ERROR, "Anthropic request body exceeded buffer");
         free(msgs_json);
