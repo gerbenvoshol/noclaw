@@ -99,6 +99,8 @@ typedef struct {
 } nc_msg_scratch;
 
 static void agent_compact_messages(nc_agent *agent) {
+    /* keep = NC_MAX_MESSAGES/2 is always >= 1 (NC_MAX_MESSAGES is a positive compile-time constant),
+     * so (keep + 1) is always positive and safe to cast to size_t. */
     int keep  = NC_MAX_MESSAGES / 2;
     int total = agent->message_count;
     int start = total - keep;
@@ -119,7 +121,8 @@ static void agent_compact_messages(nc_agent *agent) {
         return;
     }
 
-    /* Save system message (index 0) */
+    /* Save system message (index 0).  If role is somehow NULL we fall back to "system"
+     * and log a warning; the fallback is safe because nc_strlcpy handles it. */
     if (agent->messages[0].role == NULL)
         nc_log(NC_LOG_WARN, "Session compaction: system message has NULL role");
     nc_strlcpy(scratch[0].role,

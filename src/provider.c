@@ -166,13 +166,15 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
             out->name[cl] = '\0';
         }
 
-        /* arguments is a JSON string (already escaped in the response) */
+        /* arguments is a JSON string (already unescaped by the parser) */
         nc_str args = nc_json_str(nc_json_get(fn, "arguments"), "{}");
-        out->arguments_len = args.len;
-        if (args.len > 0) {
-            size_t cl = args.len < sizeof(out->arguments) - 1 ? args.len : sizeof(out->arguments) - 1;
-            memcpy(out->arguments, args.ptr, cl);
-            out->arguments[cl] = '\0';
+        {
+            size_t cl = args.len < sizeof(out->arguments) - 1
+                        ? args.len : sizeof(out->arguments) - 1;
+            if (cl > 0 && args.ptr)
+                memcpy(out->arguments, args.ptr, cl);
+            out->arguments[cl]       = '\0';
+            out->arguments_len       = args.len;
             out->arguments_truncated = (cl < args.len);
         }
 
