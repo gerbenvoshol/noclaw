@@ -223,7 +223,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     int off = 0;
     off = append_snprintf(body, body_sz, off,
         "{\"model\":\"%s\",\"messages\":%s", req->model, msgs_json);
-    if (req->temperature >= 0)
+    if (req->temperature >= 0.0)
         off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
     off = append_snprintf(body, body_sz, off, ",\"max_tokens\":%d",
         req->max_tokens > 0 ? req->max_tokens : 4096);
@@ -398,7 +398,7 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     int off = 0;
     off = append_snprintf(body, body_sz, off,
         "{\"model\":\"%s\",\"messages\":%s", req->model, msgs_json);
-    if (req->temperature >= 0)
+    if (req->temperature >= 0.0)
         off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
     off = append_snprintf(body, body_sz, off, ",\"max_tokens\":%d",
         req->max_tokens > 0 ? req->max_tokens : 4096);
@@ -807,7 +807,7 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     off = append_snprintf(body, body_sz, off,
         "{\"model\":\"%s\",\"max_tokens\":%d",
         req->model, req->max_tokens > 0 ? req->max_tokens : 4096);
-    if (req->temperature >= 0)
+    if (req->temperature >= 0.0)
         off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
     off = append_snprintf(body, body_sz, off, ",");
 

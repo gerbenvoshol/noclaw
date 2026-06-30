@@ -231,7 +231,7 @@ bool nc_config_save(const nc_config *cfg) {
         nc_jw_str(&w, "api_url", cfg->api_url);
     nc_jw_str(&w, "default_provider", cfg->default_provider);
     nc_jw_str(&w, "default_model", cfg->default_model);
-    if (cfg->default_temperature >= 0)
+    if (cfg->default_temperature >= 0.0)
         nc_jw_num(&w, "default_temperature", cfg->default_temperature);
     nc_jw_num(&w, "max_tokens", cfg->max_tokens);
 
