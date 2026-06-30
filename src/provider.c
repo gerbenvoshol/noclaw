@@ -220,31 +220,28 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); return false; }
 
-    char *template = NULL;
+    /* Direct OpenAI API uses max_completion_tokens (max_tokens is deprecated/removed
+     * on newer models such as o1/o3/o4). All other OpenAI-compatible providers
+     * (OpenRouter, Ollama, LM Studio, etc.) still use max_tokens.
+     * Match the full scheme+host prefix to avoid subdomain spoofing.
+     * This covers https://api.openai.com, https://api.openai.com/v1, and any
+     * other path under that host. */
+    static const char openai_prefix[] = "https://api.openai.com";
+    bool direct_openai = (strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0);
+    const char *tokens_key = direct_openai ? "max_completion_tokens" : "max_tokens";
 
-    int body_len;
-    if (req->tools_json) {
-        if (ctx->api_key[0]) {
-            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_completion_tokens\":%d,\"tools\":%s}";
-        } else {
-            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d,\"tools\":%s}";
-        }
-        body_len = snprintf(body, body_sz,
-            template,
-            req->model, msgs_json, req->temperature,
-            req->max_tokens > 0 ? req->max_tokens : 4096,
-            req->tools_json);
-    } else {
-        if (ctx->api_key[0]) {
-            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_completion_tokens\":%d}";
-        } else {
-            template = "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d}";
-        }
-        body_len = snprintf(body, body_sz,
-            template,
-            req->model, msgs_json, req->temperature,
-            req->max_tokens > 0 ? req->max_tokens : 4096);
-    }
+    int off = 0;
+    off = append_snprintf(body, body_sz, off,
+        "{\"model\":\"%s\",\"messages\":%s", req->model, msgs_json);
+    if (req->temperature >= 0.0)
+        off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
+    off = append_snprintf(body, body_sz, off, ",\"%s\":%d",
+        tokens_key, req->max_tokens > 0 ? req->max_tokens : 4096);
+    if (req->tools_json)
+        off = append_snprintf(body, body_sz, off, ",\"tools\":%s", req->tools_json);
+    off = append_snprintf(body, body_sz, off, "}");
+    int body_len = off;
+
     if (body_len < 0 || (size_t)body_len >= body_sz) {
         nc_log(NC_LOG_ERROR, "OpenAI request body exceeded buffer");
         free(msgs_json);
@@ -408,19 +405,18 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     char *body = (char *)malloc(body_sz);
     if (!body) { free(msgs_json); return false; }
 
-    int body_len;
-    if (req->tools_json) {
-        body_len = snprintf(body, body_sz,
-            "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d,\"tools\":%s}",
-            req->model, msgs_json, req->temperature,
-            req->max_tokens > 0 ? req->max_tokens : 4096,
-            req->tools_json);
-    } else {
-        body_len = snprintf(body, body_sz,
-            "{\"model\":\"%s\",\"messages\":%s,\"temperature\":%.2f,\"max_tokens\":%d}",
-            req->model, msgs_json, req->temperature,
-            req->max_tokens > 0 ? req->max_tokens : 4096);
-    }
+    int off = 0;
+    off = append_snprintf(body, body_sz, off,
+        "{\"model\":\"%s\",\"messages\":%s", req->model, msgs_json);
+    if (req->temperature >= 0.0)
+        off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
+    off = append_snprintf(body, body_sz, off, ",\"max_tokens\":%d",
+        req->max_tokens > 0 ? req->max_tokens : 4096);
+    if (req->tools_json)
+        off = append_snprintf(body, body_sz, off, ",\"tools\":%s", req->tools_json);
+    off = append_snprintf(body, body_sz, off, "}");
+    int body_len = off;
+
     if (body_len < 0 || (size_t)body_len >= body_sz) {
         nc_log(NC_LOG_ERROR, "Gemini request body exceeded buffer");
         free(msgs_json);
@@ -819,25 +815,27 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
 
     int off = 0;
     off = append_snprintf(body, body_sz, off,
-        "{\"model\":\"%s\",\"max_tokens\":%d,\"temperature\":%.2f,",
-        req->model, req->max_tokens > 0 ? req->max_tokens : 4096, req->temperature);
+        "{\"model\":\"%s\",\"max_tokens\":%d",
+        req->model, req->max_tokens > 0 ? req->max_tokens : 4096);
+    if (req->temperature >= 0.0)
+        off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
 
     /* System message (Anthropic puts it at top level, not in messages) */
     for (int i = 0; i < req->message_count; i++) {
         if (strcmp(req->messages[i].role, "system") == 0 && req->messages[i].content) {
-            off = append_snprintf(body, body_sz, off, "\"system\":\"");
+            off = append_snprintf(body, body_sz, off, ",\"system\":\"");
             off = json_escape_into(body, body_sz, off, req->messages[i].content);
-            off = append_snprintf(body, body_sz, off, "\",");
+            off = append_snprintf(body, body_sz, off, "\"");
             break;
         }
     }
 
     /* Tools */
     if (tools_buf)
-        off = append_snprintf(body, body_sz, off, "\"tools\":%s,", tools_buf);
+        off = append_snprintf(body, body_sz, off, ",\"tools\":%s", tools_buf);
 
-    /* Messages */
-    off = append_snprintf(body, body_sz, off, "\"messages\":%s}", msgs_json);
+    /* Messages — always the last field */
+    off = append_snprintf(body, body_sz, off, ",\"messages\":%s}", msgs_json);
     if ((size_t)off >= body_sz - 1) {
         nc_log(NC_LOG_ERROR, "Anthropic request body exceeded buffer");
         free(msgs_json);
