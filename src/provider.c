@@ -165,6 +165,7 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
             memcpy(out->id, id.ptr, cl);
             out->id[cl] = '\0';
         }
+        /* 1-based fallback ids improve readability in logs/debugging output. */
         if (!out->id[0])
             snprintf(out->id, sizeof(out->id), "call_%d", resp->tool_call_count + 1);
 
@@ -199,7 +200,10 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     /* Build messages JSON */
     size_t msgs_est = estimate_messages_size(req->messages, req->message_count);
-    if (msgs_est > (SIZE_MAX - 4096) / 2) return false;
+    if (msgs_est > (SIZE_MAX - 4096) / 2) {
+        nc_log(NC_LOG_ERROR, "OpenAI messages payload too large");
+        return false;
+    }
     size_t msgs_buf_sz = msgs_est * 2 + 4096;
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;
@@ -385,7 +389,10 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     /* Gemini OpenAI compatibility endpoint. */
     size_t msgs_est = estimate_messages_size(req->messages, req->message_count);
-    if (msgs_est > (SIZE_MAX - 4096) / 2) return false;
+    if (msgs_est > (SIZE_MAX - 4096) / 2) {
+        nc_log(NC_LOG_ERROR, "Gemini messages payload too large");
+        return false;
+    }
     size_t msgs_buf_sz = msgs_est * 2 + 4096;
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;
@@ -739,6 +746,7 @@ static void anthropic_parse_tool_calls(nc_json *content_arr, nc_chat_response *r
                 memcpy(out->id, id.ptr, cl);
                 out->id[cl] = '\0';
             }
+            /* 1-based fallback ids improve readability in logs/debugging output. */
             if (!out->id[0])
                 snprintf(out->id, sizeof(out->id), "toolu_%d", resp->tool_call_count + 1);
 
@@ -780,7 +788,10 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
 
     /* Build messages JSON (Anthropic format) */
     size_t msgs_est = estimate_messages_size(req->messages, req->message_count);
-    if (msgs_est > (SIZE_MAX - 4096) / 2) return false;
+    if (msgs_est > (SIZE_MAX - 4096) / 2) {
+        nc_log(NC_LOG_ERROR, "Anthropic messages payload too large");
+        return false;
+    }
     size_t msgs_buf_sz = msgs_est * 2 + 4096;
     char *msgs_json = (char *)malloc(msgs_buf_sz);
     if (!msgs_json) return false;

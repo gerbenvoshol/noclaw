@@ -158,6 +158,7 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
 
     /* Build new file: replace line with matching key, or append */
     if (flen > SIZE_MAX - eklen - eclen - 128) {
+        nc_log(NC_LOG_ERROR, "memory_store failed: entry too large");
         free(data);
         return false;
     }
@@ -182,6 +183,7 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
 
             if (!skip && llen > 0) {
                 if (out_len > new_cap || llen > new_cap - out_len - 1) {
+                    nc_log(NC_LOG_ERROR, "memory_store failed: rebuilt memory data exceeded buffer");
                     free(out);
                     free(data);
                     return false;
@@ -200,6 +202,7 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
     int n = snprintf(out + out_len, new_cap - out_len, "%s\t%s\t%ld\n",
                      esc_key, esc_content, (long)now);
     if (n < 0 || (size_t)n >= new_cap - out_len) {
+        nc_log(NC_LOG_ERROR, "memory_store failed: formatted entry exceeded buffer");
         free(out);
         free(data);
         return false;
@@ -305,7 +308,8 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
         int n = snprintf(line_buf, sizeof(line_buf), "[%s] %s\n", key_buf, content_buf);
         if (n < 0) continue;
         size_t line_len = (size_t)n < sizeof(line_buf) ? (size_t)n : sizeof(line_buf) - 1;
-        if (off > out_cap || line_len > out_cap - off - 1) break;
+        /* Defensive guard: off should remain < out_cap, but keep this check explicit. */
+        if (off >= out_cap || line_len > out_cap - off - 1) break;
         memcpy(out + off, line_buf, line_len);
         off += line_len;
         out[off] = '\0';
