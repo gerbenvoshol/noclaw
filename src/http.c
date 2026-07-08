@@ -547,7 +547,7 @@ static bool tls_write_all(tls_conn *c, const char *buf, size_t len) {
     return true;
 }
 
-static bool add_cap(size_t *total, size_t add) {
+static bool add_capacity_checked(size_t *total, size_t add) {
     if (*total > SIZE_MAX - add) return false;
     *total += add;
     return true;
@@ -555,6 +555,8 @@ static bool add_cap(size_t *total, size_t add) {
 
 #define NC_MAX_SIZE_T_DECIMAL_DIGITS 20
 
+/* Safely append formatted text at *off, updating it on success.
+ * Returns false on format errors or truncation. */
 static bool append_fmt(char *buf, size_t cap, size_t *off, const char *fmt, ...) {
     if (*off >= cap) return false;
     va_list args;
@@ -566,6 +568,9 @@ static bool append_fmt(char *buf, size_t cap, size_t *off, const char *fmt, ...)
     return true;
 }
 
+/* Compute required header buffer size for an HTTP request line + headers.
+ * Includes method/path/host, optional Content-Length, custom headers, final
+ * CRLF separator, and NUL terminator. Returns false on overflow. */
 static bool compute_request_cap(const char *method,
                                 const char *path,
                                 const char *host,
@@ -574,24 +579,24 @@ static bool compute_request_cap(const char *method,
                                 int header_count,
                                 size_t *out_cap) {
     size_t cap = 0;
-    if (!add_cap(&cap, strlen(method))) return false;
-    if (!add_cap(&cap, 1)) return false; /* space */
-    if (!add_cap(&cap, strlen(path))) return false;
-    if (!add_cap(&cap, strlen(" HTTP/1.1\r\nHost: "))) return false;
-    if (!add_cap(&cap, strlen(host))) return false;
-    if (!add_cap(&cap, strlen("\r\n"))) return false;
+    if (!add_capacity_checked(&cap, strlen(method))) return false;
+    if (!add_capacity_checked(&cap, 1)) return false; /* space */
+    if (!add_capacity_checked(&cap, strlen(path))) return false;
+    if (!add_capacity_checked(&cap, strlen(" HTTP/1.1\r\nHost: "))) return false;
+    if (!add_capacity_checked(&cap, strlen(host))) return false;
+    if (!add_capacity_checked(&cap, strlen("\r\n"))) return false;
     if (include_content_length) {
-        if (!add_cap(&cap, strlen("Content-Length: "))) return false;
-        if (!add_cap(&cap, NC_MAX_SIZE_T_DECIMAL_DIGITS)) return false;
-        if (!add_cap(&cap, strlen("\r\n"))) return false;
+        if (!add_capacity_checked(&cap, strlen("Content-Length: "))) return false;
+        if (!add_capacity_checked(&cap, NC_MAX_SIZE_T_DECIMAL_DIGITS)) return false;
+        if (!add_capacity_checked(&cap, strlen("\r\n"))) return false;
     }
-    if (!add_cap(&cap, strlen("Connection: close\r\n"))) return false;
+    if (!add_capacity_checked(&cap, strlen("Connection: close\r\n"))) return false;
     for (int i = 0; i < header_count; i++) {
-        if (!add_cap(&cap, strlen(headers[i]))) return false;
-        if (!add_cap(&cap, 2)) return false; /* CRLF */
+        if (!add_capacity_checked(&cap, strlen(headers[i]))) return false;
+        if (!add_capacity_checked(&cap, 2)) return false; /* CRLF */
     }
-    if (!add_cap(&cap, 2)) return false; /* final CRLF */
-    if (!add_cap(&cap, 1)) return false; /* NUL terminator */
+    if (!add_capacity_checked(&cap, 2)) return false; /* final CRLF */
+    if (!add_capacity_checked(&cap, 1)) return false; /* NUL terminator */
     *out_cap = cap;
     return true;
 }
