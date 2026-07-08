@@ -553,10 +553,11 @@ static bool add_capacity_checked(size_t *total, size_t add) {
     return true;
 }
 
-#define NC_MAX_SIZE_T_DECIMAL_DIGITS 20
+#define NC_MAX_SIZE_T_DECIMAL_DIGITS 20 /* enough for 64-bit max: 18446744073709551615 */
 
 /* Safely append formatted text at *off, updating it on success.
- * Returns false on format errors or truncation. */
+ * Returns false on format errors or when output would exceed remaining
+ * capacity; callers can treat false as "no safe append performed". */
 static bool append_fmt(char *buf, size_t cap, size_t *off, const char *fmt, ...) {
     if (*off >= cap) return false;
     va_list args;
