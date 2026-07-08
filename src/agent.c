@@ -305,6 +305,23 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
     uint64_t prev_tool_hash = 0;
     int repeat_tool_rounds = 0;
 
+    /* nc_chat_response (~17 MB) and result_buf (256 KB) are too large for the
+     * stack (default 8 MB on Linux).  Allocate both on the heap once and reuse
+     * them across iterations to avoid repeated malloc/free overhead. */
+    const char oom_msg[] = "Sorry, I ran out of memory.";
+
+    nc_chat_response *resp = malloc(sizeof(*resp));
+    if (!resp)
+        return nc_arena_dup(&agent->arena, oom_msg, sizeof(oom_msg) - 1);
+
+    char *result_buf = malloc(NC_TOOL_RESULT_MAX);
+    if (!result_buf) {
+        free(resp);
+        return nc_arena_dup(&agent->arena, oom_msg, sizeof(oom_msg) - 1);
+    }
+
+    const char *final_reply = NULL;
+
     for (int iter = 0; iter < max_iterations; iter++) {
         nc_chat_request req = {
             .messages = agent->messages,
@@ -315,28 +332,29 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
             .max_tokens = agent->config->max_tokens,
         };
 
-        nc_chat_response resp;
-        if (!agent->provider->chat(agent->provider, &req, &resp)) {
+        if (!agent->provider->chat(agent->provider, &req, resp)) {
             static const char err_msg[] = "Sorry, I encountered an error communicating with the provider.";
-            return nc_arena_dup(&agent->arena, err_msg, sizeof(err_msg) - 1);
+            final_reply = nc_arena_dup(&agent->arena, err_msg, sizeof(err_msg) - 1);
+            goto done;
         }
 
-        if (!resp.has_tool_calls) {
+        if (!resp->has_tool_calls) {
             /* Final response — no tool calls */
-            const char *reply = nc_arena_dup(&agent->arena, resp.content, strlen(resp.content));
-            agent_push_msg(agent, "assistant", resp.content, NULL, NULL, 0, NULL);
-            return reply;
+            final_reply = nc_arena_dup(&agent->arena, resp->content, strlen(resp->content));
+            agent_push_msg(agent, "assistant", resp->content, NULL, NULL, 0, NULL);
+            goto done;
         }
 
-        if (resp.tool_call_count <= 0) {
+        if (resp->tool_call_count <= 0) {
             nc_log(NC_LOG_WARN, "Provider indicated tool calls but returned none; ending loop");
             static const char loop_guard_msg[] =
                 "I couldn't continue because tool-call metadata was incomplete.";
-            return nc_arena_dup(&agent->arena, loop_guard_msg, sizeof(loop_guard_msg) - 1);
+            final_reply = nc_arena_dup(&agent->arena, loop_guard_msg, sizeof(loop_guard_msg) - 1);
+            goto done;
         }
 
         {
-            uint64_t h = tool_round_hash(resp.tool_calls, resp.tool_call_count);
+            uint64_t h = tool_round_hash(resp->tool_calls, resp->tool_call_count);
             if (iter > 0 && h == prev_tool_hash)
                 repeat_tool_rounds++;
             else
@@ -348,25 +366,26 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
                        repeat_tool_rounds + 1);
                 static const char repeat_msg[] =
                     "I stopped because the model repeated the same tool calls without progress.";
-                return nc_arena_dup(&agent->arena, repeat_msg, sizeof(repeat_msg) - 1);
+                final_reply = nc_arena_dup(&agent->arena, repeat_msg, sizeof(repeat_msg) - 1);
+                goto done;
             }
         }
 
         /* ── Tool call dispatch ───────────────────────────────── */
 
         nc_log(NC_LOG_INFO, "Tool calls: %d (iteration %d/%d)",
-               resp.tool_call_count, iter + 1, max_iterations);
+               resp->tool_call_count, iter + 1, max_iterations);
 
         /* Push assistant message with tool_calls attached */
         agent_push_msg(agent, "assistant",
-                       resp.content[0] ? resp.content : NULL,
+                       resp->content[0] ? resp->content : NULL,
                        NULL,
-                       resp.tool_calls, resp.tool_call_count,
-                       resp.raw_message_json[0] ? resp.raw_message_json : NULL);
+                       resp->tool_calls, resp->tool_call_count,
+                       resp->raw_message_json[0] ? resp->raw_message_json : NULL);
 
         /* Execute each tool call and push results */
-        for (int i = 0; i < resp.tool_call_count; i++) {
-            nc_tool_call *tc = &resp.tool_calls[i];
+        for (int i = 0; i < resp->tool_call_count; i++) {
+            nc_tool_call *tc = &resp->tool_calls[i];
             char fallback_tool_call_id[64];
             const char *tool_call_id = tc->id;
 
@@ -391,10 +410,9 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
                    strlen(tc->arguments) > arg_preview ? "...[truncated for log]" : "");
 
             nc_tool *tool = find_tool(agent, tc->name);
-            char result_buf[NC_TOOL_RESULT_MAX];
 
             if (tc->arguments_truncated) {
-                snprintf(result_buf, sizeof(result_buf),
+                snprintf(result_buf, NC_TOOL_RESULT_MAX,
                          "error: tool arguments for '%s' exceeded limit (%zu bytes > %zu bytes) and were not executed",
                          tc->name,
                          tc->arguments_len,
@@ -403,13 +421,13 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
                        "  <- tool %s blocked: arguments truncated (%zu bytes > %zu)",
                        tc->name, tc->arguments_len, sizeof(tc->arguments) - 1);
             } else if (tool) {
-                bool ok = tool->execute(tool, tc->arguments, result_buf, sizeof(result_buf));
+                bool ok = tool->execute(tool, tc->arguments, result_buf, NC_TOOL_RESULT_MAX);
                 if (!ok) {
                     nc_log(NC_LOG_WARN, "  <- tool %s returned error", tc->name);
                     /* Still push the error as the tool result — the LLM needs to see it */
                 }
             } else {
-                snprintf(result_buf, sizeof(result_buf),
+                snprintf(result_buf, NC_TOOL_RESULT_MAX,
                          "error: unknown tool '%s'", tc->name);
                 nc_log(NC_LOG_WARN, "  <- unknown tool: %s", tc->name);
             }
@@ -422,7 +440,12 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
     }
 
     static const char max_iter_msg[] = "I reached the maximum number of tool iterations. Here's what I have so far.";
-    return nc_arena_dup(&agent->arena, max_iter_msg, sizeof(max_iter_msg) - 1);
+    final_reply = nc_arena_dup(&agent->arena, max_iter_msg, sizeof(max_iter_msg) - 1);
+
+done:
+    free(resp);
+    free(result_buf);
+    return final_reply;
 }
 
 /* ── Reset conversation ───────────────────────────────────────── */
