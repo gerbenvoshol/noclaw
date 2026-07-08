@@ -546,6 +546,42 @@ static bool tls_write_all(tls_conn *c, const char *buf, size_t len) {
     return true;
 }
 
+static bool add_cap(size_t *total, size_t add) {
+    if (*total > SIZE_MAX - add) return false;
+    *total += add;
+    return true;
+}
+
+static bool compute_request_cap(const char *method,
+                                const char *path,
+                                const char *host,
+                                bool include_content_length,
+                                const char **headers,
+                                int header_count,
+                                size_t *out_cap) {
+    size_t cap = 0;
+    if (!add_cap(&cap, strlen(method))) return false;
+    if (!add_cap(&cap, 1)) return false; /* space */
+    if (!add_cap(&cap, strlen(path))) return false;
+    if (!add_cap(&cap, strlen(" HTTP/1.1\r\nHost: "))) return false;
+    if (!add_cap(&cap, strlen(host))) return false;
+    if (!add_cap(&cap, strlen("\r\n"))) return false;
+    if (include_content_length) {
+        if (!add_cap(&cap, strlen("Content-Length: "))) return false;
+        if (!add_cap(&cap, 20)) return false; /* max decimal digits for 64-bit size_t */
+        if (!add_cap(&cap, strlen("\r\n"))) return false;
+    }
+    if (!add_cap(&cap, strlen("Connection: close\r\n"))) return false;
+    for (int i = 0; i < header_count; i++) {
+        if (!add_cap(&cap, strlen(headers[i]))) return false;
+        if (!add_cap(&cap, 2)) return false; /* CRLF */
+    }
+    if (!add_cap(&cap, 2)) return false; /* final CRLF */
+    if (!add_cap(&cap, 1)) return false; /* NUL terminator */
+    *out_cap = cap;
+    return true;
+}
+
 /* ── Read until connection closes, appending to response ──────── */
 
 static void resp_init(nc_http_response *resp) {
@@ -759,10 +795,11 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
     }
 
     /* Build HTTP request */
-    size_t req_cap = strlen(pu.path) + strlen(pu.host) + 128;
-    for (int i = 0; i < header_count; i++)
-        req_cap += strlen(headers[i]) + 2;
-    req_cap += 3; /* final CRLF + NUL */
+    size_t req_cap = 0;
+    if (!compute_request_cap("POST", pu.path, pu.host, true, headers, header_count, &req_cap)) {
+        tls_close(&conn);
+        return false;
+    }
     char *req_header = (char *)malloc(req_cap);
     if (!req_header) {
         tls_close(&conn);
@@ -860,10 +897,11 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         return false;
     }
 
-    size_t req_cap = strlen(pu.path) + strlen(pu.host) + 96;
-    for (int i = 0; i < header_count; i++)
-        req_cap += strlen(headers[i]) + 2;
-    req_cap += 3; /* final CRLF + NUL */
+    size_t req_cap = 0;
+    if (!compute_request_cap("GET", pu.path, pu.host, false, headers, header_count, &req_cap)) {
+        tls_close(&conn);
+        return false;
+    }
     char *req_header = (char *)malloc(req_cap);
     if (!req_header) {
         tls_close(&conn);
