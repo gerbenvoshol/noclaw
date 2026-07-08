@@ -302,14 +302,14 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
         }
 
         n = snprintf(shell_cmd, sizeof(shell_cmd),
-                     "cd %s && %s 2>&1",
+                     "cd %s && ( %s\n) 2>&1",
                      quoted_workspace, command);
         if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
             nc_strlcpy(out, "error: command too long", out_cap);
             return false;
         }
     } else {
-        int n = snprintf(shell_cmd, sizeof(shell_cmd), "%s 2>&1", command);
+        int n = snprintf(shell_cmd, sizeof(shell_cmd), "( %s\n) 2>&1", command);
         if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
             nc_strlcpy(out, "error: command too long", out_cap);
             return false;
