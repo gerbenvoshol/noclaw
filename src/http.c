@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <stdarg.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <Security/Security.h>
@@ -25,6 +27,19 @@
 #else
 #include <bearssl.h>
 #endif
+
+static atomic_int g_http_timeout_seconds = ATOMIC_VAR_INIT(30);
+
+static int effective_http_timeout_seconds(void) {
+    int timeout = atomic_load_explicit(&g_http_timeout_seconds, memory_order_relaxed);
+    if (timeout < 1) return 1;
+    if (timeout > 3600) return 3600;
+    return timeout;
+}
+
+void nc_http_set_timeout(int timeout_seconds) {
+    atomic_store_explicit(&g_http_timeout_seconds, timeout_seconds, memory_order_relaxed);
+}
 
 /* ── URL parsing ──────────────────────────────────────────────── */
 
@@ -101,8 +116,8 @@ static int tcp_connect(const char *host, const char *port) {
         if (fd < 0) continue;
 
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            /* Set socket timeouts (30s) to prevent indefinite hangs */
-            struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+            /* Set socket timeouts to prevent indefinite hangs */
+            struct timeval tv = { .tv_sec = effective_http_timeout_seconds(), .tv_usec = 0 };
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             break;
@@ -534,6 +549,67 @@ static bool tls_write_all(tls_conn *c, const char *buf, size_t len) {
     return true;
 }
 
+static bool safe_size_add(size_t *total, size_t add) {
+    if (*total > SIZE_MAX - add) return false;
+    *total += add;
+    return true;
+}
+
+#define NC_MAX_CONTENT_LENGTH_DIGITS 20 /* conservative across targets; covers 64-bit size_t max */
+
+/* Safely append formatted text into buf at *offset.
+ * Parameters:
+ *   - buf/cap: destination buffer and total capacity.
+ *   - offset: current write position (updated only on success).
+ *   - fmt/...: printf-style format and arguments.
+ * Returns true on success. Returns false on format errors or if output would
+ * exceed remaining capacity; in that case *offset is unchanged. */
+static bool append_fmt(char *buf, size_t cap, size_t *offset, const char *fmt, ...) {
+    if (cap == 0) return false;
+    if (*offset >= cap) return false;
+    va_list args;
+    va_start(args, fmt);
+    int wrote = vsnprintf(buf + *offset, cap - *offset, fmt, args);
+    va_end(args);
+    if (wrote < 0) return false;
+    if ((size_t)wrote >= cap - *offset) return false;
+    *offset += (size_t)wrote;
+    return true;
+}
+
+/* Compute required header buffer size for an HTTP request line + headers.
+ * Includes method/path/host, optional Content-Length, custom headers, final
+ * CRLF separator, and NUL terminator. Returns false on overflow. */
+static bool compute_request_capacity(const char *method,
+                                     const char *path,
+                                     const char *host,
+                                     bool include_content_length,
+                                     const char **headers,
+                                     int header_count,
+                                     size_t *out_cap) {
+    size_t cap = 0;
+    if (!safe_size_add(&cap, strlen(method))) return false;
+    if (!safe_size_add(&cap, 1)) return false; /* space */
+    if (!safe_size_add(&cap, strlen(path))) return false;
+    if (!safe_size_add(&cap, strlen(" HTTP/1.1\r\nHost: "))) return false;
+    if (!safe_size_add(&cap, strlen(host))) return false;
+    if (!safe_size_add(&cap, strlen("\r\n"))) return false;
+    if (include_content_length) {
+        if (!safe_size_add(&cap, strlen("Content-Length: "))) return false;
+        if (!safe_size_add(&cap, NC_MAX_CONTENT_LENGTH_DIGITS)) return false;
+        if (!safe_size_add(&cap, strlen("\r\n"))) return false;
+    }
+    if (!safe_size_add(&cap, strlen("Connection: close\r\n"))) return false;
+    for (int i = 0; i < header_count; i++) {
+        if (!safe_size_add(&cap, strlen(headers[i]))) return false;
+        if (!safe_size_add(&cap, 2)) return false; /* CRLF */
+    }
+    if (!safe_size_add(&cap, 2)) return false; /* final CRLF */
+    if (!safe_size_add(&cap, 1)) return false; /* NUL terminator */
+    *out_cap = cap;
+    return true;
+}
+
 /* ── Read until connection closes, appending to response ──────── */
 
 static void resp_init(nc_http_response *resp) {
@@ -747,29 +823,41 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
     }
 
     /* Build HTTP request */
-    size_t req_cap = 8192;
+    size_t req_cap = 0;
+    if (!compute_request_capacity("POST", pu.path, pu.host, true, headers, header_count, &req_cap)) {
+        tls_close(&conn);
+        return false;
+    }
     char *req_header = (char *)malloc(req_cap);
     if (!req_header) {
         tls_close(&conn);
         return false;
     }
-    int off = snprintf(req_header, req_cap,
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n",
-        pu.path, pu.host, body_len);
+    size_t off = 0;
+    if (!append_fmt(req_header, req_cap, &off,
+                    "POST %s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Connection: close\r\n",
+                    pu.path, pu.host, body_len)) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
 
     for (int i = 0; i < header_count; i++) {
-        if ((size_t)off >= req_cap) break;
-        off += snprintf(req_header + off, req_cap - (size_t)off,
-            "%s\r\n", headers[i]);
+        if (!append_fmt(req_header, req_cap, &off, "%s\r\n", headers[i])) {
+            free(req_header);
+            tls_close(&conn);
+            return false;
+        }
     }
-    if ((size_t)off < req_cap)
-        off += snprintf(req_header + off, req_cap - (size_t)off, "\r\n");
-
-    /* Clamp offset to buffer size (snprintf returns would-be length on truncation) */
-    size_t req_len = (size_t)off < req_cap ? (size_t)off : req_cap;
+    if (!append_fmt(req_header, req_cap, &off, "\r\n")) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+    size_t req_len = off;
 
     /* Send request */
     if (!tls_write_all(&conn, req_header, req_len)) {
@@ -831,31 +919,47 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         return false;
     }
 
-    size_t req_cap = 8192;
+    size_t req_cap = 0;
+    if (!compute_request_capacity("GET", pu.path, pu.host, false, headers, header_count, &req_cap)) {
+        tls_close(&conn);
+        return false;
+    }
     char *req_header = (char *)malloc(req_cap);
     if (!req_header) {
         tls_close(&conn);
         return false;
     }
-    int off = snprintf(req_header, req_cap,
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Connection: close\r\n",
-        pu.path, pu.host);
-
-    for (int i = 0; i < header_count; i++) {
-        if ((size_t)off >= req_cap) break;
-        off += snprintf(req_header + off, req_cap - (size_t)off,
-            "%s\r\n", headers[i]);
-    }
-    if ((size_t)off < req_cap)
-        off += snprintf(req_header + off, req_cap - (size_t)off, "\r\n");
-
-    size_t req_len = (size_t)off < req_cap ? (size_t)off : req_cap;
-    if (!tls_write_all(&conn, req_header, req_len)) {
+    size_t off = 0;
+    if (!append_fmt(req_header, req_cap, &off,
+                    "GET %s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Connection: close\r\n",
+                    pu.path, pu.host)) {
+        free(req_header);
         tls_close(&conn);
         return false;
     }
+
+    for (int i = 0; i < header_count; i++) {
+        if (!append_fmt(req_header, req_cap, &off, "%s\r\n", headers[i])) {
+            free(req_header);
+            tls_close(&conn);
+            return false;
+        }
+    }
+    if (!append_fmt(req_header, req_cap, &off, "\r\n")) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+
+    size_t req_len = off;
+    if (!tls_write_all(&conn, req_header, req_len)) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+    free(req_header);
 
     if (!tls_flush(&conn)) {
         tls_close(&conn);

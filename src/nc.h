@@ -156,6 +156,7 @@ typedef struct nc_config {
     char default_model[128];
     double default_temperature;
     int max_tokens;
+    int http_timeout_seconds;
 
     /* Gateway */
     char     gateway_host[64];
@@ -377,6 +378,7 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
                   nc_http_response *resp);
 bool nc_http_get(const char *url, const char **headers, int header_count,
                  nc_http_response *resp);
+void nc_http_set_timeout(int timeout_seconds);
 void nc_http_response_free(nc_http_response *resp);
 
 /* ── CLI commands ─────────────────────────────────────────────── */

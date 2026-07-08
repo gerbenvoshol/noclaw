@@ -188,6 +188,7 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
   "default_model": "anthropic/claude-sonnet-4",
   "default_temperature": 0.7,
   "max_tokens": 4096,
+  "http_timeout_seconds": 30,
   "gateway": {
     "port": 3000,
     "host": "127.0.0.1",
@@ -252,7 +253,7 @@ For local models, omit `api_key` and set `api_url` instead:
 }
 ```
 
-Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
+Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_HTTP_TIMEOUT`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
 
 ## Gateway API
 

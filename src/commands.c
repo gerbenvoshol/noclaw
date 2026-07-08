@@ -82,6 +82,7 @@ int nc_cmd_agent(int argc, char **argv) {
     if (!cfg.api_key[0] && !is_local) { fprintf(stderr, "No API key configured. Run `noclaw onboard` first\n"); return 1; }
 
     nc_provider prov = make_provider(&cfg);
+    nc_http_set_timeout(cfg.http_timeout_seconds);
     nc_memory mem;
     nc_tool tools[NC_MAX_TOOLS];
     int tool_count;
@@ -155,6 +156,7 @@ int nc_cmd_gateway(int argc, char **argv) {
     }
 
     nc_provider prov = make_provider(&cfg);
+    nc_http_set_timeout(cfg.http_timeout_seconds);
     nc_memory mem;
     nc_tool tools[NC_MAX_TOOLS];
     int tool_count;
@@ -191,6 +193,7 @@ int nc_cmd_status(int argc, char **argv) {
     printf("  API Key:    %s\n", (loaded && cfg.api_key[0]) ? "configured" : "not set");
     printf("  Heartbeat:  %s\n", (loaded && cfg.heartbeat_enabled) ? "enabled" : "disabled");
     printf("  Sandbox:    %s\n", loaded ? cfg.sandbox_backend : "-");
+    printf("  HTTP timeout: %ds\n", loaded ? cfg.http_timeout_seconds : 0);
     return 0;
 }
 
@@ -209,13 +212,14 @@ int nc_cmd_onboard(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("noclaw onboard -- quick setup\n\n");
             printf("USAGE:\n");
-            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL] [--max-tokens N] [--workspace PATH] [--instructions PATH]\n\n");
+            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL] [--max-tokens N] [--http-timeout N] [--workspace PATH] [--instructions PATH]\n\n");
             printf("OPTIONS:\n");
             printf("  --provider PROVIDER  openrouter, anthropic, openai, gemini, ollama\n");
             printf("  --api-key KEY        API key for remote providers\n");
             printf("  --base-url URL       OpenAI-compatible base URL\n");
             printf("  --model MODEL        Default model to use\n");
             printf("  --max-tokens N       Maximum completion tokens per request\n");
+            printf("  --http-timeout N     HTTP socket timeout in seconds\n");
             printf("  --workspace PATH     Default workspace directory\n");
             printf("  --instructions PATH  Default system instructions file\n");
             printf("  -h, --help           Show this help\n\n");
@@ -230,6 +234,7 @@ int nc_cmd_onboard(int argc, char **argv) {
     const char *base_url = NULL;
     const char *model = NULL;
     const char *max_tokens = NULL;
+    const char *http_timeout = NULL;
     const char *workspace = NULL;
     const char *instructions = NULL;
 
@@ -244,6 +249,8 @@ int nc_cmd_onboard(int argc, char **argv) {
             model = argv[++i];
         else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc)
             max_tokens = argv[++i];
+        else if (strcmp(argv[i], "--http-timeout") == 0 && i + 1 < argc)
+            http_timeout = argv[++i];
         else if (strcmp(argv[i], "--workspace") == 0 && i + 1 < argc)
             workspace = argv[++i];
         else if (strcmp(argv[i], "--instructions") == 0 && i + 1 < argc)
@@ -262,6 +269,11 @@ int nc_cmd_onboard(int argc, char **argv) {
         long mt = strtol(max_tokens, NULL, 10);
         if (mt > 0 && mt <= 10000000L)
             cfg.max_tokens = (int)mt;
+    }
+    if (http_timeout) {
+        long t = strtol(http_timeout, NULL, 10);
+        if (t >= 1 && t <= 3600L)
+            cfg.http_timeout_seconds = (int)t;
     }
     if (workspace)
         nc_strlcpy(cfg.workspace_dir, workspace, sizeof(cfg.workspace_dir));
@@ -347,6 +359,7 @@ int nc_cmd_onboard(int argc, char **argv) {
         printf("Provider:        %s\n", cfg.default_provider);
         printf("Model:           %s\n", cfg.default_model);
         printf("Max tokens:      %d\n", cfg.max_tokens);
+        printf("HTTP timeout:    %ds\n", cfg.http_timeout_seconds);
         if (cfg.instructions_file[0])
             printf("Instructions:    %s\n", cfg.instructions_file);
         if (cfg.api_url[0])
