@@ -555,7 +555,7 @@ static bool safe_size_add(size_t *total, size_t add) {
     return true;
 }
 
-#define NC_MAX_CONTENT_LENGTH_DIGITS 20 /* enough for 64-bit max: 18446744073709551615 */
+#define NC_MAX_CONTENT_LENGTH_DIGITS 20 /* conservative across targets; covers 64-bit size_t max */
 
 /* Safely append formatted text into buf at *offset.
  * Parameters:
@@ -565,12 +565,14 @@ static bool safe_size_add(size_t *total, size_t add) {
  * Returns true on success. Returns false on format errors or if output would
  * exceed remaining capacity; in that case *offset is unchanged. */
 static bool append_fmt(char *buf, size_t cap, size_t *offset, const char *fmt, ...) {
+    if (cap == 0) return false;
     if (*offset >= cap) return false;
     va_list args;
     va_start(args, fmt);
     int wrote = vsnprintf(buf + *offset, cap - *offset, fmt, args);
     va_end(args);
-    if (wrote < 0 || (size_t)wrote >= cap - *offset) return false;
+    if (wrote < 0) return false;
+    if ((size_t)wrote >= cap - *offset) return false;
     *offset += (size_t)wrote;
     return true;
 }
