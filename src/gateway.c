@@ -49,16 +49,16 @@ static void send_json(int fd, int status, const char *json) {
 typedef struct {
     char method[8];
     char path[256];
-    char body[4096];
+    char body[65536];
     size_t body_len;
-    char auth_header[128];    /* Authorization: Bearer ... */
-    char pairing_header[16];  /* X-Pairing-Code */
+    char auth_header[1200];   /* Authorization: Bearer ... */
+    char pairing_header[32];  /* X-Pairing-Code */
 } http_request;
 
 static bool parse_request(int fd, http_request *req) {
     memset(req, 0, sizeof(*req));
 
-    char buf[8192];
+    char buf[131072];
     size_t total = 0;
     while (total < sizeof(buf) - 1) {
         ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
@@ -219,7 +219,7 @@ static void handle_request(nc_gateway *gw, int client_fd) {
         nc_str message = nc_json_str(nc_json_get(body, "message"), "");
 
         if (message.len > 0) {
-            char msg_buf[4096];
+            char msg_buf[65536];
             size_t cplen = message.len < sizeof(msg_buf) - 1 ? message.len : sizeof(msg_buf) - 1;
             memcpy(msg_buf, message.ptr, cplen);
             msg_buf[cplen] = '\0';
@@ -227,7 +227,7 @@ static void handle_request(nc_gateway *gw, int client_fd) {
             const char *reply = nc_agent_chat(gw->agent, msg_buf);
 
             /* Build JSON response */
-            char resp_buf[8192];
+            char resp_buf[131072];
             nc_jw w;
             nc_jw_init(&w, resp_buf, sizeof(resp_buf));
             nc_jw_obj_open(&w);

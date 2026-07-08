@@ -216,7 +216,7 @@ nc_channel nc_channel_cli(void) {
 /* ── Telegram channel (Bot API, long polling) ─────────────────── */
 
 typedef struct {
-    char token[256];
+    char token[1024];
     long long last_update_id;
 } tg_ctx;
 
@@ -225,7 +225,7 @@ static bool tg_poll(nc_channel *self, nc_incoming_msg *out) {
     memset(out, 0, sizeof(*out));
 
     /* GET /getUpdates?offset=<last+1>&timeout=30 */
-    char url[512];
+    char url[1536];
     snprintf(url, sizeof(url),
         "https://api.telegram.org/bot%s/getUpdates?offset=%lld&timeout=30&allowed_updates=[\"message\"]",
         ctx->token, ctx->last_update_id + 1);
@@ -287,12 +287,12 @@ static bool tg_poll(nc_channel *self, nc_incoming_msg *out) {
 static bool tg_send(nc_channel *self, const char *to, const char *text) {
     tg_ctx *ctx = (tg_ctx *)self->ctx;
 
-    char url[512];
+    char url[1536];
     snprintf(url, sizeof(url),
         "https://api.telegram.org/bot%s/sendMessage", ctx->token);
 
     /* Build JSON body */
-    char body[8192];
+    char body[65536];
     nc_jw w;
     nc_jw_init(&w, body, sizeof(body));
     nc_jw_obj_open(&w);
@@ -337,7 +337,7 @@ nc_channel nc_channel_telegram(const char *bot_token) {
  */
 
 typedef struct {
-    char token[256];
+    char token[1024];
     char channel_id[32];
     char last_message_id[32];
 } discord_ctx;
@@ -353,7 +353,7 @@ static bool discord_poll(nc_channel *self, nc_incoming_msg *out) {
     }
 
     /* GET /channels/{id}/messages?after={last}&limit=1 */
-    char url[512];
+    char url[1536];
     if (ctx->last_message_id[0]) {
         snprintf(url, sizeof(url),
             "https://discord.com/api/v10/channels/%s/messages?after=%s&limit=1",
@@ -364,7 +364,7 @@ static bool discord_poll(nc_channel *self, nc_incoming_msg *out) {
             ctx->channel_id);
     }
 
-    char auth[300];
+    char auth[1200];
     snprintf(auth, sizeof(auth), "Authorization: Bot %s", ctx->token);
     const char *headers[] = { auth, "User-Agent: noclaw/0.1" };
 
@@ -445,18 +445,18 @@ static bool discord_send(nc_channel *self, const char *to, const char *text) {
     discord_ctx *ctx = (discord_ctx *)self->ctx;
     (void)to;
 
-    char url[256];
+    char url[1536];
     snprintf(url, sizeof(url),
         "https://discord.com/api/v10/channels/%s/messages", ctx->channel_id);
 
-    char body[8192];
+    char body[65536];
     nc_jw w;
     nc_jw_init(&w, body, sizeof(body));
     nc_jw_obj_open(&w);
     nc_jw_str(&w, "content", text);
     nc_jw_obj_close(&w);
 
-    char auth[300];
+    char auth[1200];
     snprintf(auth, sizeof(auth), "Authorization: Bot %s", ctx->token);
     const char *headers[] = {
         "Content-Type: application/json",
@@ -505,7 +505,7 @@ nc_channel nc_channel_discord(const char *bot_token) {
  */
 
 typedef struct {
-    char token[256];      /* xoxb-... bot token */
+    char token[1024];      /* xoxb-... bot token */
     char channel_id[32];  /* channel to monitor */
     char last_ts[32];     /* timestamp of last seen message */
 } slack_ctx;
@@ -520,7 +520,7 @@ static bool slack_poll(nc_channel *self, nc_incoming_msg *out) {
     }
 
     /* GET conversations.history?channel={id}&oldest={ts}&limit=1 */
-    char url[512];
+    char url[1536];
     if (ctx->last_ts[0]) {
         snprintf(url, sizeof(url),
             "https://slack.com/api/conversations.history?channel=%s&oldest=%s&limit=1",
@@ -531,7 +531,7 @@ static bool slack_poll(nc_channel *self, nc_incoming_msg *out) {
             ctx->channel_id);
     }
 
-    char auth[300];
+    char auth[1200];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", ctx->token);
     const char *headers[] = { auth };
 
@@ -607,7 +607,7 @@ static bool slack_send(nc_channel *self, const char *to, const char *text) {
     slack_ctx *ctx = (slack_ctx *)self->ctx;
     const char *channel = (to && to[0]) ? to : ctx->channel_id;
 
-    char body[8192];
+    char body[65536];
     nc_jw w;
     nc_jw_init(&w, body, sizeof(body));
     nc_jw_obj_open(&w);
@@ -615,7 +615,7 @@ static bool slack_send(nc_channel *self, const char *to, const char *text) {
     nc_jw_str(&w, "text", text);
     nc_jw_obj_close(&w);
 
-    char auth[300];
+    char auth[1200];
     snprintf(auth, sizeof(auth), "Authorization: Bearer %s", ctx->token);
     const char *headers[] = {
         "Content-Type: application/json; charset=utf-8",
