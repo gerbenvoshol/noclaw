@@ -308,16 +308,15 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
     /* nc_chat_response (~17 MB) and result_buf (256 KB) are too large for the
      * stack (default 8 MB on Linux).  Allocate both on the heap once and reuse
      * them across iterations to avoid repeated malloc/free overhead. */
-    nc_chat_response *resp = (nc_chat_response *)malloc(sizeof(*resp));
-    if (!resp) {
-        static const char oom_msg[] = "Sorry, I ran out of memory.";
-        return nc_arena_dup(&agent->arena, oom_msg, sizeof(oom_msg) - 1);
-    }
+    static const char oom_msg[] = "Sorry, I ran out of memory.";
 
-    char *result_buf = (char *)malloc(NC_TOOL_RESULT_MAX);
+    nc_chat_response *resp = malloc(sizeof(*resp));
+    if (!resp)
+        return nc_arena_dup(&agent->arena, oom_msg, sizeof(oom_msg) - 1);
+
+    char *result_buf = malloc(NC_TOOL_RESULT_MAX);
     if (!result_buf) {
         free(resp);
-        static const char oom_msg[] = "Sorry, I ran out of memory.";
         return nc_arena_dup(&agent->arena, oom_msg, sizeof(oom_msg) - 1);
     }
 
@@ -440,10 +439,8 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
         /* Loop back to provider with the tool results */
     }
 
-    {
-        static const char max_iter_msg[] = "I reached the maximum number of tool iterations. Here's what I have so far.";
-        final_reply = nc_arena_dup(&agent->arena, max_iter_msg, sizeof(max_iter_msg) - 1);
-    }
+    static const char max_iter_msg[] = "I reached the maximum number of tool iterations. Here's what I have so far.";
+    final_reply = nc_arena_dup(&agent->arena, max_iter_msg, sizeof(max_iter_msg) - 1);
 
 done:
     free(resp);
