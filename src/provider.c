@@ -60,6 +60,12 @@ static bool json_array_complete(const char *s) {
     return n >= 2 && s[0] == '[' && s[n - 1] == ']';
 }
 
+static bool json_object_complete(const char *s) {
+    if (!s) return false;
+    size_t n = strlen(s);
+    return n >= 2 && s[0] == '{' && s[n - 1] == '}';
+}
+
 /* Compute buffer size needed for messages (generous estimate) */
 static size_t estimate_messages_size(const nc_message *msgs, int count) {
     size_t sz = 512;
@@ -248,7 +254,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     off = append_snprintf(body, body_sz, off, "}");
     int body_len = off;
 
-    if (body_len < 0 || (size_t)body_len >= body_sz) {
+    if (body_len < 0 || (size_t)body_len >= body_sz || !json_object_complete(body)) {
         nc_log(NC_LOG_ERROR, "OpenAI request body exceeded buffer");
         free(msgs_json);
         free(body);
@@ -423,7 +429,7 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     off = append_snprintf(body, body_sz, off, "}");
     int body_len = off;
 
-    if (body_len < 0 || (size_t)body_len >= body_sz) {
+    if (body_len < 0 || (size_t)body_len >= body_sz || !json_object_complete(body)) {
         nc_log(NC_LOG_ERROR, "Gemini request body exceeded buffer");
         free(msgs_json);
         free(body);
@@ -809,8 +815,15 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     if (req->tools_json) {
         size_t tools_sz = strlen(req->tools_json) * 3 + 4096;
         tools_buf = (char *)malloc(tools_sz);
-        if (tools_buf)
-            anthropic_tools_json_from_defs(tools_buf, tools_sz, req);
+        if (tools_buf) {
+            if (!anthropic_tools_json_from_defs(tools_buf, tools_sz, req) ||
+                !json_array_complete(tools_buf)) {
+                nc_log(NC_LOG_ERROR, "Anthropic tools JSON conversion failed or was truncated");
+                free(msgs_json);
+                free(tools_buf);
+                return false;
+            }
+        }
     }
 
     /* Build request body */
@@ -842,7 +855,7 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
 
     /* Messages — always the last field */
     off = append_snprintf(body, body_sz, off, ",\"messages\":%s}", msgs_json);
-    if ((size_t)off >= body_sz - 1) {
+    if ((size_t)off >= body_sz - 1 || !json_object_complete(body)) {
         nc_log(NC_LOG_ERROR, "Anthropic request body exceeded buffer");
         free(msgs_json);
         free(tools_buf);
