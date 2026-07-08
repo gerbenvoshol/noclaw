@@ -761,15 +761,15 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
         pu.path, pu.host, body_len);
 
     for (int i = 0; i < header_count; i++) {
-        if ((size_t)off >= sizeof(req_header)) break;
-        off += snprintf(req_header + off, sizeof(req_header) - (size_t)off,
+        if ((size_t)off >= req_cap) break;
+        off += snprintf(req_header + off, req_cap - (size_t)off,
             "%s\r\n", headers[i]);
     }
-    if ((size_t)off < sizeof(req_header))
-        off += snprintf(req_header + off, sizeof(req_header) - (size_t)off, "\r\n");
+    if ((size_t)off < req_cap)
+        off += snprintf(req_header + off, req_cap - (size_t)off, "\r\n");
 
     /* Clamp offset to buffer size (snprintf returns would-be length on truncation) */
-    size_t req_len = (size_t)off < sizeof(req_header) ? (size_t)off : sizeof(req_header);
+    size_t req_len = (size_t)off < req_cap ? (size_t)off : req_cap;
 
     /* Send request */
     if (!tls_write_all(&conn, req_header, req_len)) {
@@ -844,14 +844,14 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         pu.path, pu.host);
 
     for (int i = 0; i < header_count; i++) {
-        if ((size_t)off >= sizeof(req_header)) break;
-        off += snprintf(req_header + off, sizeof(req_header) - (size_t)off,
+        if ((size_t)off >= req_cap) break;
+        off += snprintf(req_header + off, req_cap - (size_t)off,
             "%s\r\n", headers[i]);
     }
-    if ((size_t)off < sizeof(req_header))
-        off += snprintf(req_header + off, sizeof(req_header) - (size_t)off, "\r\n");
+    if ((size_t)off < req_cap)
+        off += snprintf(req_header + off, req_cap - (size_t)off, "\r\n");
 
-    size_t req_len = (size_t)off < sizeof(req_header) ? (size_t)off : sizeof(req_header);
+    size_t req_len = (size_t)off < req_cap ? (size_t)off : req_cap;
     if (!tls_write_all(&conn, req_header, req_len)) {
         tls_close(&conn);
         return false;
