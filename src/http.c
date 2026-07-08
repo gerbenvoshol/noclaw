@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <stdarg.h>
 
 #ifdef __APPLE__
 #include <Security/Security.h>
@@ -552,6 +553,19 @@ static bool add_cap(size_t *total, size_t add) {
     return true;
 }
 
+#define NC_MAX_SIZE_T_DECIMAL_DIGITS 20
+
+static bool append_fmt(char *buf, size_t cap, size_t *off, const char *fmt, ...) {
+    if (*off >= cap) return false;
+    va_list args;
+    va_start(args, fmt);
+    int wrote = vsnprintf(buf + *off, cap - *off, fmt, args);
+    va_end(args);
+    if (wrote < 0 || (size_t)wrote >= cap - *off) return false;
+    *off += (size_t)wrote;
+    return true;
+}
+
 static bool compute_request_cap(const char *method,
                                 const char *path,
                                 const char *host,
@@ -568,7 +582,7 @@ static bool compute_request_cap(const char *method,
     if (!add_cap(&cap, strlen("\r\n"))) return false;
     if (include_content_length) {
         if (!add_cap(&cap, strlen("Content-Length: "))) return false;
-        if (!add_cap(&cap, 20)) return false; /* max decimal digits for 64-bit size_t */
+        if (!add_cap(&cap, NC_MAX_SIZE_T_DECIMAL_DIGITS)) return false;
         if (!add_cap(&cap, strlen("\r\n"))) return false;
     }
     if (!add_cap(&cap, strlen("Connection: close\r\n"))) return false;
@@ -805,36 +819,30 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
         tls_close(&conn);
         return false;
     }
-    int wrote = snprintf(req_header, req_cap,
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n",
-        pu.path, pu.host, body_len);
-    if (wrote < 0 || (size_t)wrote >= req_cap) {
+    size_t off = 0;
+    if (!append_fmt(req_header, req_cap, &off,
+                    "POST %s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Connection: close\r\n",
+                    pu.path, pu.host, body_len)) {
         free(req_header);
         tls_close(&conn);
         return false;
     }
-    size_t off = (size_t)wrote;
 
     for (int i = 0; i < header_count; i++) {
-        wrote = snprintf(req_header + off, req_cap - off,
-            "%s\r\n", headers[i]);
-        if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+        if (!append_fmt(req_header, req_cap, &off, "%s\r\n", headers[i])) {
             free(req_header);
             tls_close(&conn);
             return false;
         }
-        off += (size_t)wrote;
     }
-    wrote = snprintf(req_header + off, req_cap - off, "\r\n");
-    if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+    if (!append_fmt(req_header, req_cap, &off, "\r\n")) {
         free(req_header);
         tls_close(&conn);
         return false;
     }
-    off += (size_t)wrote;
     size_t req_len = off;
 
     /* Send request */
@@ -907,35 +915,29 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         tls_close(&conn);
         return false;
     }
-    int wrote = snprintf(req_header, req_cap,
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Connection: close\r\n",
-        pu.path, pu.host);
-    if (wrote < 0 || (size_t)wrote >= req_cap) {
+    size_t off = 0;
+    if (!append_fmt(req_header, req_cap, &off,
+                    "GET %s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Connection: close\r\n",
+                    pu.path, pu.host)) {
         free(req_header);
         tls_close(&conn);
         return false;
     }
-    size_t off = (size_t)wrote;
 
     for (int i = 0; i < header_count; i++) {
-        wrote = snprintf(req_header + off, req_cap - off,
-            "%s\r\n", headers[i]);
-        if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+        if (!append_fmt(req_header, req_cap, &off, "%s\r\n", headers[i])) {
             free(req_header);
             tls_close(&conn);
             return false;
         }
-        off += (size_t)wrote;
     }
-    wrote = snprintf(req_header + off, req_cap - off, "\r\n");
-    if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+    if (!append_fmt(req_header, req_cap, &off, "\r\n")) {
         free(req_header);
         tls_close(&conn);
         return false;
     }
-    off += (size_t)wrote;
 
     size_t req_len = off;
     if (!tls_write_all(&conn, req_header, req_len)) {
