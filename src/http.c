@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <Security/Security.h>
@@ -27,16 +28,17 @@
 #include <bearssl.h>
 #endif
 
-static int g_http_timeout_seconds = 30;
+static atomic_int g_http_timeout_seconds = ATOMIC_VAR_INIT(30);
 
 static int effective_http_timeout_seconds(void) {
-    if (g_http_timeout_seconds < 1) return 1;
-    if (g_http_timeout_seconds > 3600) return 3600;
-    return g_http_timeout_seconds;
+    int timeout = atomic_load_explicit(&g_http_timeout_seconds, memory_order_relaxed);
+    if (timeout < 1) return 1;
+    if (timeout > 3600) return 3600;
+    return timeout;
 }
 
 void nc_http_set_timeout(int timeout_seconds) {
-    g_http_timeout_seconds = timeout_seconds;
+    atomic_store_explicit(&g_http_timeout_seconds, timeout_seconds, memory_order_relaxed);
 }
 
 /* ── URL parsing ──────────────────────────────────────────────── */
@@ -553,11 +555,15 @@ static bool safe_size_add(size_t *total, size_t add) {
     return true;
 }
 
-#define NC_MAX_SIZE_T_DECIMAL_DIGITS 20 /* enough for 64-bit max: 18446744073709551615 */
+#define NC_MAX_CONTENT_LENGTH_DIGITS 20 /* enough for 64-bit max: 18446744073709551615 */
 
-/* Safely append formatted text at *off, updating it on success.
- * Returns false on format errors or when output would exceed remaining
- * capacity; callers can treat false as "no safe append performed". */
+/* Safely append formatted text into buf at *offset.
+ * Parameters:
+ *   - buf/cap: destination buffer and total capacity.
+ *   - offset: current write position (updated only on success).
+ *   - fmt/...: printf-style format and arguments.
+ * Returns true on success. Returns false on format errors or if output would
+ * exceed remaining capacity; in that case *offset is unchanged. */
 static bool append_fmt(char *buf, size_t cap, size_t *offset, const char *fmt, ...) {
     if (*offset >= cap) return false;
     va_list args;
@@ -588,7 +594,7 @@ static bool compute_request_capacity(const char *method,
     if (!safe_size_add(&cap, strlen("\r\n"))) return false;
     if (include_content_length) {
         if (!safe_size_add(&cap, strlen("Content-Length: "))) return false;
-        if (!safe_size_add(&cap, NC_MAX_SIZE_T_DECIMAL_DIGITS)) return false;
+        if (!safe_size_add(&cap, NC_MAX_CONTENT_LENGTH_DIGITS)) return false;
         if (!safe_size_add(&cap, strlen("\r\n"))) return false;
     }
     if (!safe_size_add(&cap, strlen("Connection: close\r\n"))) return false;
