@@ -33,16 +33,32 @@ void nc_agent_init(nc_agent *agent, nc_config *cfg, nc_provider *prov,
     nc_arena_init(&agent->arena, 64 * 1024);
 
     /* System prompt */
-    static const char sys_prompt[] =
+    static const char default_sys_prompt[] =
         "You are noclaw, the smallest AI assistant. "
         "Pure C. Under 100KB. You are helpful, concise, and fast. "
         "Use available tools when needed to complete tasks.";
+    const char *sys_prompt = default_sys_prompt;
+    size_t sys_prompt_len = sizeof(default_sys_prompt) - 1;
+    char *file_prompt = NULL;
+
+    if (cfg->instructions_file[0]) {
+        size_t len = 0;
+        file_prompt = nc_read_file(cfg->instructions_file, &len);
+        if (file_prompt) {
+            sys_prompt = file_prompt;
+            sys_prompt_len = len;
+        } else {
+            nc_log(NC_LOG_WARN, "Could not read instructions file: %s", cfg->instructions_file);
+        }
+    }
 
     agent->messages[0] = (nc_message){
         .role = nc_arena_dup(&agent->arena, "system", 6),
-        .content = nc_arena_dup(&agent->arena, sys_prompt, sizeof(sys_prompt) - 1),
+        .content = nc_arena_dup(&agent->arena, sys_prompt, sys_prompt_len),
     };
     agent->message_count = 1;
+    free(file_prompt);
+
 }
 
 /* Safe snprintf append */

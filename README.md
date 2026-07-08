@@ -65,6 +65,13 @@ make release
 # Chat
 ./noclaw agent -m "Hello, noclaw!"
 
+# Send prompt/instructions from a file
+./noclaw agent -f prompt.txt
+
+# Run separate agents in separate workspaces
+./noclaw agent -w /tmp/noclaw-agent-a
+./noclaw agent -w /tmp/noclaw-agent-b -i instructions.md
+
 # Interactive mode
 ./noclaw agent
 
@@ -245,7 +252,7 @@ For local models, omit `api_key` and set `api_url` instead:
 }
 ```
 
-Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
+Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
 
 ## Gateway API
 
@@ -261,6 +268,9 @@ Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MOD
 | ---------------- | ------------------------- |
 | `onboard`        | Quick setup (default)     |
 | `agent -m "..."` | Single message mode       |
+| `agent -f file` | Single message from a file |
+| `agent -w dir` | Run with a separate workspace |
+| `agent -i file` | Use system instructions from a file |
 | `agent`          | Interactive chat mode     |
 | `gateway`        | Start HTTP gateway server |
 | `status`         | Show system status        |

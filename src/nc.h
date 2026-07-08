@@ -147,6 +147,7 @@ typedef struct nc_config {
     char config_dir[512];
     char config_path[1024];
     char workspace_dir[1024];
+    char instructions_file[1024];
 
     /* Top-level */
     char api_key[1024];

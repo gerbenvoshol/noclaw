@@ -13,125 +13,124 @@
 
 /* ── Agent command ────────────────────────────────────────────── */
 
+typedef struct nc_agent_opts {
+    const char *single_msg;
+    const char *message_file;
+    const char *channel_name;
+} nc_agent_opts;
+
+static bool parse_agent_opts(int argc, char **argv, nc_config *cfg, nc_agent_opts *opts) {
+    memset(opts, 0, sizeof(*opts));
+    for (int i = 0; i < argc; i++) {
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--message") == 0) && i + 1 < argc)
+            opts->single_msg = argv[++i];
+        else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc)
+            opts->message_file = argv[++i];
+        else if ((strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--workspace") == 0) && i + 1 < argc)
+            nc_strlcpy(cfg->workspace_dir, argv[++i], sizeof(cfg->workspace_dir));
+        else if ((strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--instructions") == 0) && i + 1 < argc)
+            nc_strlcpy(cfg->instructions_file, argv[++i], sizeof(cfg->instructions_file));
+        else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc)
+            opts->channel_name = argv[++i];
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("noclaw agent [options]\n\n");
+            printf("  -m, --message TEXT        Send a single message\n");
+            printf("  -f, --file PATH           Send instructions/prompt from a file\n");
+            printf("  -w, --workspace PATH      Use a separate workspace for this agent\n");
+            printf("  -i, --instructions PATH   Use PATH as system instructions\n");
+            printf("      --channel NAME        cli, telegram, discord, slack\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *provider_is_local_name = "ollama";
+
+static nc_provider make_provider(const nc_config *cfg) {
+    if (strcmp(cfg->default_provider, "anthropic") == 0)
+        return nc_provider_anthropic(cfg->api_key, cfg->api_url);
+    if (strcmp(cfg->default_provider, "gemini") == 0)
+        return nc_provider_gemini(cfg->api_key, cfg->api_url);
+    return nc_provider_openai(cfg->api_key, cfg->api_url);
+}
+
+static void make_agent_stack(nc_config *cfg, nc_provider *prov, nc_memory *mem,
+                             nc_tool *tools, int *tool_count, nc_agent *agent) {
+    char mem_path[1024];
+    nc_mkdir_p(cfg->workspace_dir);
+    nc_path_join(mem_path, sizeof(mem_path), cfg->workspace_dir, "memories.tsv");
+    *mem = nc_memory_flat(mem_path);
+
+    *tool_count = 0;
+    tools[(*tool_count)++] = nc_tool_shell(cfg);
+    tools[(*tool_count)++] = nc_tool_apply_patch(cfg);
+    tools[(*tool_count)++] = nc_tool_file_read(cfg);
+    tools[(*tool_count)++] = nc_tool_file_write(cfg);
+    tools[(*tool_count)++] = nc_tool_memory_store(mem);
+    tools[(*tool_count)++] = nc_tool_memory_recall(mem);
+
+    nc_agent_init(agent, cfg, prov, tools, *tool_count, mem);
+}
+
 int nc_cmd_agent(int argc, char **argv) {
     nc_config cfg;
-    if (!nc_config_load(&cfg)) {
-        fprintf(stderr, "No config found -- run `noclaw onboard` first\n");
-        return 1;
-    }
+    if (!nc_config_load(&cfg)) { fprintf(stderr, "No config found -- run `noclaw onboard` first\n"); return 1; }
+    nc_agent_opts opts;
+    if (!parse_agent_opts(argc, argv, &cfg, &opts)) return 0;
+    bool is_local = strcmp(cfg.default_provider, provider_is_local_name) == 0;
+    if (!cfg.api_key[0] && !is_local) { fprintf(stderr, "No API key configured. Run `noclaw onboard` first\n"); return 1; }
 
-    /* Local providers (e.g. ollama) don't need an API key */
-    bool is_local = strcmp(cfg.default_provider, "ollama") == 0;
-    if (!cfg.api_key[0] && !is_local) {
-        fprintf(stderr, "No API key configured. Run `noclaw onboard` first\n");
-        return 1;
-    }
-
-    /* Check for -m (single message mode) and --channel */
-    const char *single_msg = NULL;
-    const char *channel_name = NULL;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc)
-            single_msg = argv[i + 1];
-        else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc)
-            channel_name = argv[++i];
-    }
-
-    /* Create provider based on config.
-     * "ollama" is OpenAI-compatible; base URL defaults to localhost:11434. */
-    nc_provider prov;
-    if (strcmp(cfg.default_provider, "anthropic") == 0)
-        prov = nc_provider_anthropic(cfg.api_key, cfg.api_url);
-    else if (strcmp(cfg.default_provider, "gemini") == 0)
-        prov = nc_provider_gemini(cfg.api_key, cfg.api_url);
-    else
-        prov = nc_provider_openai(cfg.api_key, cfg.api_url);
-
-    /* Memory: flat-file by default */
-    char mem_path[1024];
-    nc_path_join(mem_path, sizeof(mem_path), cfg.workspace_dir, "memories.tsv");
-    nc_mkdir_p(cfg.workspace_dir);
-    nc_memory mem = nc_memory_flat(mem_path);
-
-    /* Create tools */
+    nc_provider prov = make_provider(&cfg);
+    nc_memory mem;
     nc_tool tools[NC_MAX_TOOLS];
-    int tool_count = 0;
-    tools[tool_count++] = nc_tool_shell(&cfg);
-    tools[tool_count++] = nc_tool_apply_patch(&cfg);
-    tools[tool_count++] = nc_tool_file_read(&cfg);
-    tools[tool_count++] = nc_tool_file_write(&cfg);
-    tools[tool_count++] = nc_tool_memory_store(&mem);
-    tools[tool_count++] = nc_tool_memory_recall(&mem);
-
-    /* Agent */
+    int tool_count;
     nc_agent agent;
-    nc_agent_init(&agent, &cfg, &prov, tools, tool_count, &mem);
+    make_agent_stack(&cfg, &prov, &mem, tools, &tool_count, &agent);
+
+    char *file_msg = NULL;
+    const char *single_msg = opts.single_msg;
+    if (opts.message_file) {
+        size_t file_len = 0;
+        file_msg = nc_read_file(opts.message_file, &file_len);
+        if (!file_msg) { fprintf(stderr, "Cannot read message file: %s\n", opts.message_file); nc_agent_free(&agent); mem.free(&mem); if (prov.free) prov.free(&prov); return 1; }
+        single_msg = file_msg;
+    }
 
     if (single_msg) {
-        /* Single message mode */
         const char *reply = nc_agent_chat(&agent, single_msg);
         if (reply) printf("%s\n", reply);
     } else {
-        /* Select channel */
         nc_channel ch;
-        if (channel_name && strcmp(channel_name, "telegram") == 0) {
+        if (opts.channel_name && strcmp(opts.channel_name, "telegram") == 0) {
             const char *tok = cfg.telegram_token[0] ? cfg.telegram_token : getenv("NOCLAW_TELEGRAM_TOKEN");
             if (!tok || !tok[0]) { fprintf(stderr, "No Telegram token. Set NOCLAW_TELEGRAM_TOKEN or config.\n"); return 1; }
-            ch = nc_channel_telegram(tok);
-            printf("noclaw v" NC_VERSION " -- telegram mode\n");
-        } else if (channel_name && strcmp(channel_name, "discord") == 0) {
+            ch = nc_channel_telegram(tok); printf("noclaw v" NC_VERSION " -- telegram mode\n");
+        } else if (opts.channel_name && strcmp(opts.channel_name, "discord") == 0) {
             const char *tok = cfg.discord_token[0] ? cfg.discord_token : getenv("NOCLAW_DISCORD_TOKEN");
             if (!tok || !tok[0]) { fprintf(stderr, "No Discord token. Set NOCLAW_DISCORD_TOKEN or config.\n"); return 1; }
-            ch = nc_channel_discord(tok);
-            printf("noclaw v" NC_VERSION " -- discord mode\n");
-        } else if (channel_name && strcmp(channel_name, "slack") == 0) {
+            ch = nc_channel_discord(tok); printf("noclaw v" NC_VERSION " -- discord mode\n");
+        } else if (opts.channel_name && strcmp(opts.channel_name, "slack") == 0) {
             const char *tok = cfg.slack_token[0] ? cfg.slack_token : getenv("NOCLAW_SLACK_TOKEN");
             if (!tok || !tok[0]) { fprintf(stderr, "No Slack token. Set NOCLAW_SLACK_TOKEN or config.\n"); return 1; }
-            ch = nc_channel_slack(tok);
-            printf("noclaw v" NC_VERSION " -- slack mode\n");
-        } else {
-            ch = nc_channel_cli();
-            printf("noclaw v" NC_VERSION " -- interactive mode (type /quit to exit, /new to reset)\n");
-        }
-
-        printf("  Provider: %s\n", cfg.default_provider);
-        printf("  Model:    %s\n", cfg.default_model);
-        printf("  Tools:    %d loaded\n\n", tool_count);
-
+            ch = nc_channel_slack(tok); printf("noclaw v" NC_VERSION " -- slack mode\n");
+        } else { ch = nc_channel_cli(); printf("noclaw v" NC_VERSION " -- interactive mode (type /quit to exit, /new to reset)\n"); }
+        printf("  Provider:  %s\n", cfg.default_provider);
+        printf("  Model:     %s\n", cfg.default_model);
+        printf("  Workspace: %s\n", cfg.workspace_dir);
+        if (cfg.instructions_file[0]) printf("  Instr:     %s\n", cfg.instructions_file);
+        printf("  Tools:     %d loaded\n\n", tool_count);
         nc_incoming_msg msg;
-
         while (ch.poll(&ch, &msg)) {
-            /* Handle chat commands (CLI only) */
-            if (strcmp(msg.content, "/quit") == 0 || strcmp(msg.content, "/exit") == 0)
-                break;
-            if (strcmp(msg.content, "/new") == 0 || strcmp(msg.content, "/reset") == 0) {
-                nc_agent_reset(&agent);
-                ch.send(&ch, msg.sender, "Session reset.");
-                continue;
-            }
-            if (strcmp(msg.content, "/status") == 0) {
-                char status_buf[256];
-                snprintf(status_buf, sizeof(status_buf), "Model: %s | Messages: %d | Provider: %s",
-                         cfg.default_model, agent.message_count, cfg.default_provider);
-                ch.send(&ch, msg.sender, status_buf);
-                continue;
-            }
-            if (strcmp(msg.content, "/help") == 0) {
-                ch.send(&ch, msg.sender, "Commands: /new /status /quit /help");
-                continue;
-            }
-
-            const char *reply = nc_agent_chat(&agent, msg.content);
-            if (reply) ch.send(&ch, msg.sender, reply);
+            if (strcmp(msg.content, "/quit") == 0 || strcmp(msg.content, "/exit") == 0) break;
+            if (strcmp(msg.content, "/new") == 0 || strcmp(msg.content, "/reset") == 0) { nc_agent_reset(&agent); ch.send(&ch, msg.sender, "Session reset."); continue; }
+            if (strcmp(msg.content, "/status") == 0) { char status_buf[1536]; snprintf(status_buf, sizeof(status_buf), "Model: %s | Messages: %d | Provider: %s | Workspace: %s", cfg.default_model, agent.message_count, cfg.default_provider, cfg.workspace_dir); ch.send(&ch, msg.sender, status_buf); continue; }
+            if (strcmp(msg.content, "/help") == 0) { ch.send(&ch, msg.sender, "Commands: /new /status /quit /help"); continue; }
+            const char *reply = nc_agent_chat(&agent, msg.content); if (reply) ch.send(&ch, msg.sender, reply);
         }
-
         ch.free(&ch);
     }
-
-    nc_agent_free(&agent);
-    mem.free(&mem);
-    if (prov.free) prov.free(&prov);
-    return 0;
+    nc_agent_free(&agent); mem.free(&mem); if (prov.free) prov.free(&prov); free(file_msg); return 0;
 }
 
 /* ── Gateway command ──────────────────────────────────────────── */
@@ -149,34 +148,18 @@ int nc_cmd_gateway(int argc, char **argv) {
             cfg.gateway_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
             nc_strlcpy(cfg.gateway_host, argv[++i], sizeof(cfg.gateway_host));
+        else if ((strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--workspace") == 0) && i + 1 < argc)
+            nc_strlcpy(cfg.workspace_dir, argv[++i], sizeof(cfg.workspace_dir));
+        else if ((strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--instructions") == 0) && i + 1 < argc)
+            nc_strlcpy(cfg.instructions_file, argv[++i], sizeof(cfg.instructions_file));
     }
 
-    /* Provider */
-    nc_provider prov;
-    if (strcmp(cfg.default_provider, "anthropic") == 0)
-        prov = nc_provider_anthropic(cfg.api_key, cfg.api_url);
-    else if (strcmp(cfg.default_provider, "gemini") == 0)
-        prov = nc_provider_gemini(cfg.api_key, cfg.api_url);
-    else
-        prov = nc_provider_openai(cfg.api_key, cfg.api_url);
-
-    /* Memory: flat-file by default */
-    char mem_path2[1024];
-    nc_path_join(mem_path2, sizeof(mem_path2), cfg.workspace_dir, "memories.tsv");
-    nc_mkdir_p(cfg.workspace_dir);
-    nc_memory mem = nc_memory_flat(mem_path2);
-
+    nc_provider prov = make_provider(&cfg);
+    nc_memory mem;
     nc_tool tools[NC_MAX_TOOLS];
-    int tool_count = 0;
-    tools[tool_count++] = nc_tool_shell(&cfg);
-    tools[tool_count++] = nc_tool_apply_patch(&cfg);
-    tools[tool_count++] = nc_tool_file_read(&cfg);
-    tools[tool_count++] = nc_tool_file_write(&cfg);
-    tools[tool_count++] = nc_tool_memory_store(&mem);
-    tools[tool_count++] = nc_tool_memory_recall(&mem);
-
+    int tool_count;
     nc_agent agent;
-    nc_agent_init(&agent, &cfg, &prov, tools, tool_count, &mem);
+    make_agent_stack(&cfg, &prov, &mem, tools, &tool_count, &agent);
 
     nc_gateway gw;
     nc_gateway_init(&gw, &cfg, &agent);
@@ -199,6 +182,7 @@ int nc_cmd_status(int argc, char **argv) {
     printf("─────────────────────────────\n");
     printf("  Config:     %s\n", loaded ? cfg.config_path : "(not found)");
     printf("  Workspace:  %s\n", loaded ? cfg.workspace_dir : "(not configured)");
+    printf("  Instr file: %s\n", (loaded && cfg.instructions_file[0]) ? cfg.instructions_file : "-");
     printf("  Provider:   %s\n", loaded ? cfg.default_provider : "-");
     printf("  Model:      %s\n", loaded ? cfg.default_model : "-");
     printf("  Gateway:    %s:%d\n", loaded ? cfg.gateway_host : "-", loaded ? cfg.gateway_port : 0);
@@ -225,13 +209,15 @@ int nc_cmd_onboard(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("noclaw onboard -- quick setup\n\n");
             printf("USAGE:\n");
-            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL] [--max-tokens N]\n\n");
+            printf("  noclaw onboard [--provider PROVIDER] [--api-key KEY] [--base-url URL] [--model MODEL] [--max-tokens N] [--workspace PATH] [--instructions PATH]\n\n");
             printf("OPTIONS:\n");
             printf("  --provider PROVIDER  openrouter, anthropic, openai, gemini, ollama\n");
             printf("  --api-key KEY        API key for remote providers\n");
             printf("  --base-url URL       OpenAI-compatible base URL\n");
             printf("  --model MODEL        Default model to use\n");
             printf("  --max-tokens N       Maximum completion tokens per request\n");
+            printf("  --workspace PATH     Default workspace directory\n");
+            printf("  --instructions PATH  Default system instructions file\n");
             printf("  -h, --help           Show this help\n\n");
             printf("If no provider/api key is passed, onboard runs interactively and asks for setup values.\n");
             return 0;
@@ -244,6 +230,8 @@ int nc_cmd_onboard(int argc, char **argv) {
     const char *base_url = NULL;
     const char *model = NULL;
     const char *max_tokens = NULL;
+    const char *workspace = NULL;
+    const char *instructions = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc)
@@ -256,6 +244,10 @@ int nc_cmd_onboard(int argc, char **argv) {
             model = argv[++i];
         else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc)
             max_tokens = argv[++i];
+        else if (strcmp(argv[i], "--workspace") == 0 && i + 1 < argc)
+            workspace = argv[++i];
+        else if (strcmp(argv[i], "--instructions") == 0 && i + 1 < argc)
+            instructions = argv[++i];
     }
 
     if (provider)
@@ -271,6 +263,10 @@ int nc_cmd_onboard(int argc, char **argv) {
         if (mt > 0 && mt <= 10000000L)
             cfg.max_tokens = (int)mt;
     }
+    if (workspace)
+        nc_strlcpy(cfg.workspace_dir, workspace, sizeof(cfg.workspace_dir));
+    if (instructions)
+        nc_strlcpy(cfg.instructions_file, instructions, sizeof(cfg.instructions_file));
 
     /* Interactive mode when no provider-related flags were given on the CLI */
     if (!provider && !api_key) {
@@ -351,6 +347,8 @@ int nc_cmd_onboard(int argc, char **argv) {
         printf("Provider:        %s\n", cfg.default_provider);
         printf("Model:           %s\n", cfg.default_model);
         printf("Max tokens:      %d\n", cfg.max_tokens);
+        if (cfg.instructions_file[0])
+            printf("Instructions:    %s\n", cfg.instructions_file);
         if (cfg.api_url[0])
             printf("Base URL:        %s\n", cfg.api_url);
         printf("\nRun `noclaw agent` to start chatting!\n");
