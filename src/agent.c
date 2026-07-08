@@ -308,7 +308,7 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
     /* nc_chat_response (~17 MB) and result_buf (256 KB) are too large for the
      * stack (default 8 MB on Linux).  Allocate both on the heap once and reuse
      * them across iterations to avoid repeated malloc/free overhead. */
-    static const char oom_msg[] = "Sorry, I ran out of memory.";
+    const char oom_msg[] = "Sorry, I ran out of memory.";
 
     nc_chat_response *resp = malloc(sizeof(*resp));
     if (!resp)
