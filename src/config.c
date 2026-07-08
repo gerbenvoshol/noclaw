@@ -24,6 +24,7 @@ void nc_config_defaults(nc_config *cfg) {
     nc_strlcpy(cfg->default_model, "anthropic/claude-sonnet-4", sizeof(cfg->default_model));
     cfg->default_temperature = -1.0;  /* -1 = not set; provider uses its own default */
     cfg->max_tokens = 4096;
+    cfg->http_timeout_seconds = 30;
 
     /* Gateway */
     nc_strlcpy(cfg->gateway_host, "127.0.0.1", sizeof(cfg->gateway_host));
@@ -105,6 +106,8 @@ bool nc_config_load(nc_config *cfg) {
         cfg->default_temperature = nc_json_num(v, -1.0);
     if ((v = nc_json_get(root, "max_tokens")))
         cfg->max_tokens = (int)nc_json_num(v, 4096);
+    if ((v = nc_json_get(root, "http_timeout_seconds")))
+        cfg->http_timeout_seconds = (int)nc_json_num(v, 30);
     if ((v = nc_json_get(root, "instructions_file")))
         str_to_buf(cfg->instructions_file, sizeof(cfg->instructions_file), nc_json_str(v, ""));
 
@@ -242,6 +245,7 @@ bool nc_config_save(const nc_config *cfg) {
     if (cfg->default_temperature >= 0.0)
         nc_jw_num(&w, "default_temperature", cfg->default_temperature);
     nc_jw_num(&w, "max_tokens", cfg->max_tokens);
+    nc_jw_num(&w, "http_timeout_seconds", cfg->http_timeout_seconds);
 
     /* Gateway */
     nc_jw_raw(&w, "gateway", "{");
@@ -412,6 +416,10 @@ void nc_config_apply_env(nc_config *cfg) {
         long mt = strtol(v, NULL, 10);
         if (mt > 0 && mt <= 10000000L) cfg->max_tokens = (int)mt;
     }
+    if ((v = getenv("NOCLAW_HTTP_TIMEOUT"))) {
+        long t = strtol(v, NULL, 10);
+        if (t >= 1 && t <= 3600) cfg->http_timeout_seconds = (int)t;
+    }
     if ((v = getenv("NOCLAW_GATEWAY_PORT"))) {
         long p = strtol(v, NULL, 10);
         if (p > 0 && p <= 65535) cfg->gateway_port = (uint16_t)p;
@@ -450,6 +458,7 @@ void nc_test_config(void) {
     NC_ASSERT(strcmp(cfg.default_provider, "openrouter") == 0, "config default provider");
     NC_ASSERT(cfg.default_temperature == -1.0, "config default temp (unset)");
     NC_ASSERT(cfg.max_tokens == 4096, "config default max_tokens");
+    NC_ASSERT(cfg.http_timeout_seconds == 30, "config default http timeout");
     NC_ASSERT(cfg.gateway_port == 3000, "config default port");
     NC_ASSERT(cfg.gateway_require_pairing == true, "config default pairing");
     NC_ASSERT(cfg.gateway_allow_public_bind == false, "config default no public bind");

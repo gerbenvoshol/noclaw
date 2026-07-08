@@ -26,6 +26,18 @@
 #include <bearssl.h>
 #endif
 
+static int g_http_timeout_seconds = 30;
+
+static int effective_http_timeout_seconds(void) {
+    if (g_http_timeout_seconds < 1) return 1;
+    if (g_http_timeout_seconds > 3600) return 3600;
+    return g_http_timeout_seconds;
+}
+
+void nc_http_set_timeout(int timeout_seconds) {
+    g_http_timeout_seconds = timeout_seconds;
+}
+
 /* ── URL parsing ──────────────────────────────────────────────── */
 
 typedef struct {
@@ -101,8 +113,8 @@ static int tcp_connect(const char *host, const char *port) {
         if (fd < 0) continue;
 
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            /* Set socket timeouts (30s) to prevent indefinite hangs */
-            struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+            /* Set socket timeouts to prevent indefinite hangs */
+            struct timeval tv = { .tv_sec = effective_http_timeout_seconds(), .tv_usec = 0 };
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             break;
@@ -747,29 +759,46 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
     }
 
     /* Build HTTP request */
-    size_t req_cap = 8192;
+    size_t req_cap = strlen(pu.path) + strlen(pu.host) + 128;
+    for (int i = 0; i < header_count; i++)
+        req_cap += strlen(headers[i]) + 2;
+    req_cap += 3; /* final CRLF + NUL */
     char *req_header = (char *)malloc(req_cap);
     if (!req_header) {
         tls_close(&conn);
         return false;
     }
-    int off = snprintf(req_header, req_cap,
+    int wrote = snprintf(req_header, req_cap,
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n",
         pu.path, pu.host, body_len);
+    if (wrote < 0 || (size_t)wrote >= req_cap) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+    size_t off = (size_t)wrote;
 
     for (int i = 0; i < header_count; i++) {
-        if ((size_t)off >= req_cap) break;
-        off += snprintf(req_header + off, req_cap - (size_t)off,
+        wrote = snprintf(req_header + off, req_cap - off,
             "%s\r\n", headers[i]);
+        if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+            free(req_header);
+            tls_close(&conn);
+            return false;
+        }
+        off += (size_t)wrote;
     }
-    if ((size_t)off < req_cap)
-        off += snprintf(req_header + off, req_cap - (size_t)off, "\r\n");
-
-    /* Clamp offset to buffer size (snprintf returns would-be length on truncation) */
-    size_t req_len = (size_t)off < req_cap ? (size_t)off : req_cap;
+    wrote = snprintf(req_header + off, req_cap - off, "\r\n");
+    if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+    off += (size_t)wrote;
+    size_t req_len = off;
 
     /* Send request */
     if (!tls_write_all(&conn, req_header, req_len)) {
@@ -831,31 +860,52 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         return false;
     }
 
-    size_t req_cap = 8192;
+    size_t req_cap = strlen(pu.path) + strlen(pu.host) + 96;
+    for (int i = 0; i < header_count; i++)
+        req_cap += strlen(headers[i]) + 2;
+    req_cap += 3; /* final CRLF + NUL */
     char *req_header = (char *)malloc(req_cap);
     if (!req_header) {
         tls_close(&conn);
         return false;
     }
-    int off = snprintf(req_header, req_cap,
+    int wrote = snprintf(req_header, req_cap,
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Connection: close\r\n",
         pu.path, pu.host);
-
-    for (int i = 0; i < header_count; i++) {
-        if ((size_t)off >= req_cap) break;
-        off += snprintf(req_header + off, req_cap - (size_t)off,
-            "%s\r\n", headers[i]);
-    }
-    if ((size_t)off < req_cap)
-        off += snprintf(req_header + off, req_cap - (size_t)off, "\r\n");
-
-    size_t req_len = (size_t)off < req_cap ? (size_t)off : req_cap;
-    if (!tls_write_all(&conn, req_header, req_len)) {
+    if (wrote < 0 || (size_t)wrote >= req_cap) {
+        free(req_header);
         tls_close(&conn);
         return false;
     }
+    size_t off = (size_t)wrote;
+
+    for (int i = 0; i < header_count; i++) {
+        wrote = snprintf(req_header + off, req_cap - off,
+            "%s\r\n", headers[i]);
+        if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+            free(req_header);
+            tls_close(&conn);
+            return false;
+        }
+        off += (size_t)wrote;
+    }
+    wrote = snprintf(req_header + off, req_cap - off, "\r\n");
+    if (wrote < 0 || (size_t)wrote >= req_cap - off) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+    off += (size_t)wrote;
+
+    size_t req_len = off;
+    if (!tls_write_all(&conn, req_header, req_len)) {
+        free(req_header);
+        tls_close(&conn);
+        return false;
+    }
+    free(req_header);
 
     if (!tls_flush(&conn)) {
         tls_close(&conn);
