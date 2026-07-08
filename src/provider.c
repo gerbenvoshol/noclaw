@@ -69,9 +69,15 @@ static size_t estimate_messages_size(const nc_message *msgs, int count) {
             sz += strlen(msgs[i].content) * 2;
         if (msgs[i].raw_json)
             sz += strlen(msgs[i].raw_json);
+        if (msgs[i].tool_call_id)
+            sz += strlen(msgs[i].tool_call_id) * 2;
+        if (msgs[i].role)
+            sz += strlen(msgs[i].role) * 2;
         /* tool_calls in assistant messages */
         for (int j = 0; j < msgs[i].tool_call_count; j++) {
             sz += 512; /* per-call overhead */
+            sz += strlen(msgs[i].tool_calls[j].id) * 2;
+            sz += strlen(msgs[i].tool_calls[j].name) * 2;
             sz += strlen(msgs[i].tool_calls[j].arguments) * 2;
         }
     }

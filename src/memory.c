@@ -308,12 +308,22 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
         int n = snprintf(line_buf, sizeof(line_buf), "[%s] %s\n", key_buf, content_buf);
         if (n < 0) continue;
         size_t line_len = (size_t)n < sizeof(line_buf) ? (size_t)n : sizeof(line_buf) - 1;
-        /* Defensive guard: off should remain < out_cap, but keep this check explicit. */
-        if (off >= out_cap || line_len > out_cap - off - 1) break;
+        size_t avail;
+
+        if (off >= out_cap - 1)
+            break;
+
+        avail = out_cap - off - 1;
+        if (line_len > avail)
+            line_len = avail;
+
         memcpy(out + off, line_buf, line_len);
         off += line_len;
         out[off] = '\0';
         count++;
+
+        if (avail == line_len)
+            break;
     }
 
     free(data);

@@ -249,7 +249,6 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
     const nc_config *cfg = (const nc_config *)self->ctx;
     char command[NC_SHELL_COMMAND_MAX];
     char shell_cmd[NC_SHELL_COMMAND_MAX + PATH_MAX * 2 + 128];
-    char quoted_workspace[PATH_MAX * 2 + 8];
     char block_reason[128];
     size_t full_len = 0;
     nc_extract_status est;
@@ -289,6 +288,7 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
 
     if (cfg->workspace_only) {
         char workspace[PATH_MAX];
+        char quoted_workspace[PATH_MAX * 4 + 8];
         int n;
 
         if (!realpath(cfg->workspace_dir, workspace)) {
@@ -296,9 +296,14 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
             return false;
         }
 
+        if (!shell_quote_single(quoted_workspace, sizeof(quoted_workspace), workspace)) {
+            nc_strlcpy(out, "error: workspace path too long", out_cap);
+            return false;
+        }
+
         n = snprintf(shell_cmd, sizeof(shell_cmd),
-                     "cd \"%s\" && %s 2>&1",
-                     workspace, command);
+                     "cd %s && %s 2>&1",
+                     quoted_workspace, command);
         if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
             nc_strlcpy(out, "error: command too long", out_cap);
             return false;
