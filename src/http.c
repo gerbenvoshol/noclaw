@@ -747,8 +747,13 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
     }
 
     /* Build HTTP request */
-    char req_header[4096];
-    int off = snprintf(req_header, sizeof(req_header),
+    size_t req_cap = 8192;
+    char *req_header = (char *)malloc(req_cap);
+    if (!req_header) {
+        tls_close(&conn);
+        return false;
+    }
+    int off = snprintf(req_header, req_cap,
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Content-Length: %zu\r\n"
@@ -769,9 +774,11 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
     /* Send request */
     if (!tls_write_all(&conn, req_header, req_len)) {
         nc_log(NC_LOG_ERROR, "Failed to send HTTP headers");
+        free(req_header);
         tls_close(&conn);
         return false;
     }
+    free(req_header);
 
     if (body && body_len > 0) {
         if (!tls_write_all(&conn, body, body_len)) {
@@ -824,8 +831,13 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         return false;
     }
 
-    char req_header[4096];
-    int off = snprintf(req_header, sizeof(req_header),
+    size_t req_cap = 8192;
+    char *req_header = (char *)malloc(req_cap);
+    if (!req_header) {
+        tls_close(&conn);
+        return false;
+    }
+    int off = snprintf(req_header, req_cap,
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Connection: close\r\n",

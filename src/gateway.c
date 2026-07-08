@@ -204,7 +204,7 @@ static void handle_request(nc_gateway *gw, int client_fd) {
     /* POST /webhook — requires bearer token */
     if (strcmp(req.path, "/webhook") == 0 && strcmp(req.method, "POST") == 0) {
         /* Check auth */
-        char expected[128];
+        char expected[256];
         snprintf(expected, sizeof(expected), "Bearer %s", gw->bearer_token);
         if (!gw->paired || !ct_str_eq(req.auth_header, expected)) {
             send_json(client_fd, 401, "{\"error\":\"unauthorized\"}");

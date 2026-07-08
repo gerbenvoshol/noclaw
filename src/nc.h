@@ -33,7 +33,7 @@
 #define NC_SHELL_COMMAND_MAX (256 * 1024)
 #define NC_PATCH_INPUT_MAX   (256 * 1024)
 #define NC_FILE_CONTENT_MAX  (256 * 1024)
-#define NC_RESPONSE_CONTENT_MAX 16384
+#define NC_RESPONSE_CONTENT_MAX (256 * 1024)
 #define NC_LOG_PREVIEW_MAX   160
 
 /* ── Arena allocator ──────────────────────────────────────────── */
@@ -149,8 +149,8 @@ typedef struct nc_config {
     char workspace_dir[1024];
 
     /* Top-level */
-    char api_key[256];
-    char api_url[256];
+    char api_key[1024];
+    char api_url[1024];
     char default_provider[64];
     char default_model[128];
     double default_temperature;
@@ -181,9 +181,9 @@ typedef struct nc_config {
     char sandbox_backend[32];
 
     /* Channels */
-    char telegram_token[256];
-    char discord_token[256];
-    char slack_token[256];
+    char telegram_token[1024];
+    char discord_token[1024];
+    char slack_token[1024];
 
     /* Identity */
     char identity_format[32];
@@ -205,7 +205,7 @@ void nc_config_apply_env(nc_config *cfg);
 /* ── Provider vtable ──────────────────────────────────────────── */
 
 /* Parsed tool call from provider response */
-#define NC_MAX_TOOL_CALLS 16
+#define NC_MAX_TOOL_CALLS 64
 
 typedef struct nc_tool_call {
     char id[64];           /* "call_abc123" (OpenAI) or "toolu_xxx" (Anthropic) */

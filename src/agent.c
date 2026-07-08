@@ -428,20 +428,35 @@ const char *nc_agent_chat(nc_agent *agent, const char *user_input) {
 /* ── Reset conversation ───────────────────────────────────────── */
 
 void nc_agent_reset(nc_agent *agent) {
-    /* Copy system prompt to stack BEFORE resetting arena (avoids use-after-free) */
-    char role_buf[32];
-    char content_buf[512];
-    nc_strlcpy(role_buf, agent->messages[0].role, sizeof(role_buf));
-    nc_strlcpy(content_buf, agent->messages[0].content, sizeof(content_buf));
+    /* Copy system prompt off-arena BEFORE resetting arena (avoids use-after-free). */
+    const char *role_src = agent->messages[0].role ? agent->messages[0].role : "system";
+    const char *content_src = agent->messages[0].content ? agent->messages[0].content : "";
+    char *role_copy = strdup(role_src);
+    char *content_copy = strdup(content_src);
+
+    if (!role_copy || !content_copy) {
+        free(role_copy);
+        free(content_copy);
+        role_copy = strdup("system");
+        content_copy = strdup("You are noclaw, the smallest AI assistant.");
+        if (!role_copy || !content_copy) {
+            free(role_copy);
+            free(content_copy);
+            return;
+        }
+    }
 
     nc_arena_reset(&agent->arena);
 
-    /* Re-duplicate system prompt in fresh arena from stack copies */
+    /* Re-duplicate system prompt in fresh arena from heap copies. */
     agent->messages[0] = (nc_message){
-        .role = nc_arena_dup(&agent->arena, role_buf, strlen(role_buf)),
-        .content = nc_arena_dup(&agent->arena, content_buf, strlen(content_buf)),
+        .role = nc_arena_dup(&agent->arena, role_copy, strlen(role_copy)),
+        .content = nc_arena_dup(&agent->arena, content_copy, strlen(content_copy)),
     };
     agent->message_count = 1;
+
+    free(role_copy);
+    free(content_copy);
 }
 
 void nc_agent_free(nc_agent *agent) {

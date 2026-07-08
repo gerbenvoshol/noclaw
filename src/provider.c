@@ -267,7 +267,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     headers[0] = "Content-Type: application/json";
 
-    char auth_hdr[300];
+    char auth_hdr[1200];
     if (ctx->api_key[0]) {
         snprintf(auth_hdr, sizeof(auth_hdr),
                  "Authorization: Bearer %s", ctx->api_key);
@@ -275,7 +275,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     }
 
     /* URL */
-    char url[512];
+    char url[1536];
     if (ctx->api_url[0])
         snprintf(url, sizeof(url), "%s/chat/completions", ctx->api_url);
     else
@@ -440,13 +440,13 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     int header_count = 1;
     headers[0] = "Content-Type: application/json";
 
-    char auth_hdr[300];
+    char auth_hdr[1200];
     if (ctx->api_key[0]) {
         snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", ctx->api_key);
         headers[header_count++] = auth_hdr;
     }
 
-    char url[512];
+    char url[1536];
     if (ctx->api_url[0])
         snprintf(url, sizeof(url), "%s/chat/completions", ctx->api_url);
     else
@@ -864,7 +864,7 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     }
 
     /* Headers */
-    char auth_hdr[300];
+    char auth_hdr[1200];
     snprintf(auth_hdr, sizeof(auth_hdr), "x-api-key: %s", ctx->api_key);
     const char *headers[] = {
         "Content-Type: application/json",
@@ -872,7 +872,7 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
         "anthropic-version: 2023-06-01",
     };
 
-    char url[512];
+    char url[1536];
     if (ctx->api_url[0])
         snprintf(url, sizeof(url), "%s/messages", ctx->api_url);
     else
