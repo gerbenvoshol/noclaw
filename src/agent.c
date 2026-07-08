@@ -61,14 +61,37 @@ static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ..
 
 /* ── Build tools JSON for the provider ────────────────────────── */
 
+
+static size_t estimate_tools_json_size(nc_agent *agent) {
+    size_t sz = 32;
+    for (int i = 0; i < agent->tool_count; i++) {
+        sz += 128;
+        if (agent->tools[i].def.name)
+            sz += strlen(agent->tools[i].def.name) * 2;
+        if (agent->tools[i].def.description)
+            sz += strlen(agent->tools[i].def.description) * 2;
+        if (agent->tools[i].def.parameters_json)
+            sz += strlen(agent->tools[i].def.parameters_json);
+    }
+    return sz;
+}
+
+static bool json_array_complete(const char *s) {
+    size_t n;
+    if (!s) return false;
+    n = strlen(s);
+    return n >= 2 && s[0] == '[' && s[n - 1] == ']';
+}
 static const char *build_tools_json(nc_agent *agent) {
+    size_t bufsz;
+    char *buf;
+    int off = 0;
+
     if (agent->tool_count == 0) return NULL;
 
-    /* 32KB — enough for NC_MAX_TOOLS=32 tool definitions */
-    static const size_t bufsz = 32768;
-    char *buf = (char *)nc_arena_alloc(&agent->arena, bufsz);
+    bufsz = estimate_tools_json_size(agent);
+    buf = (char *)nc_arena_alloc(&agent->arena, bufsz);
     if (!buf) return NULL;
-    int off = 0;
     off = append_snprintf(buf, bufsz, off, "[");
 
     for (int i = 0; i < agent->tool_count; i++) {
@@ -81,6 +104,10 @@ static const char *build_tools_json(nc_agent *agent) {
     }
 
     off = append_snprintf(buf, bufsz, off, "]");
+    if (!json_array_complete(buf)) {
+        nc_log(NC_LOG_ERROR, "Tools JSON exceeded allocated buffer");
+        return NULL;
+    }
     return buf;
 }
 
