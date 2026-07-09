@@ -210,6 +210,10 @@ static bool replace_owned_string(char **dst, const char *src, size_t len) {
     return true;
 }
 
+static char *build_bearer_auth(const char *token) {
+    return nc_format("%s%s", "Authorization: Bearer ", token ? token : "");
+}
+
 nc_channel nc_channel_cli(void) {
     cli_ctx *ctx = (cli_ctx *)calloc(1, sizeof(cli_ctx));
     return (nc_channel){
@@ -297,6 +301,8 @@ static bool tg_poll(nc_channel *self, nc_incoming_msg *out) {
 
 static bool tg_send(nc_channel *self, const char *to, const char *text) {
     tg_ctx *ctx = (tg_ctx *)self->ctx;
+    if (!to || !text)
+        return false;
 
     char *url = nc_format("https://api.telegram.org/bot%s/sendMessage",
                           ctx->token ? ctx->token : "");
@@ -339,8 +345,9 @@ static void tg_free(nc_channel *self) {
 
 nc_channel nc_channel_telegram(const char *bot_token) {
     tg_ctx *ctx = (tg_ctx *)calloc(1, sizeof(tg_ctx));
-    if (ctx)
-        ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
+    if (!ctx)
+        return (nc_channel){ .name = "telegram", .ctx = NULL, .poll = tg_poll, .send = tg_send, .free = tg_free };
+    ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
     return (nc_channel){
         .name = "telegram",
         .ctx  = ctx,
@@ -465,6 +472,8 @@ static bool discord_poll(nc_channel *self, nc_incoming_msg *out) {
 static bool discord_send(nc_channel *self, const char *to, const char *text) {
     discord_ctx *ctx = (discord_ctx *)self->ctx;
     (void)to;
+    if (!text)
+        return false;
 
     char *url = nc_format("https://discord.com/api/v10/channels/%s/messages",
                           ctx->channel_id ? ctx->channel_id : "");
@@ -520,8 +529,9 @@ static void discord_free(nc_channel *self) {
 
 nc_channel nc_channel_discord(const char *bot_token) {
     discord_ctx *ctx = (discord_ctx *)calloc(1, sizeof(discord_ctx));
-    if (ctx)
-        ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
+    if (!ctx)
+        return (nc_channel){ .name = "discord", .ctx = NULL, .poll = discord_poll, .send = discord_send, .free = discord_free };
+    ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
 
     /* Channel ID from env or will be set from first incoming message */
     const char *ch = getenv("NOCLAW_DISCORD_CHANNEL");
@@ -567,7 +577,7 @@ static bool slack_poll(nc_channel *self, nc_incoming_msg *out) {
                     ctx->channel_id, ctx->last_ts)
         : nc_format("https://slack.com/api/conversations.history?channel=%s&limit=1",
                     ctx->channel_id);
-    char *auth = nc_format("%s%s", "Authorization: Bearer ", ctx->token ? ctx->token : "");
+    char *auth = build_bearer_auth(ctx->token);
     if (!url || !auth) {
         free(url);
         free(auth);
@@ -649,6 +659,8 @@ static bool slack_poll(nc_channel *self, nc_incoming_msg *out) {
 
 static bool slack_send(nc_channel *self, const char *to, const char *text) {
     slack_ctx *ctx = (slack_ctx *)self->ctx;
+    if (!text)
+        return false;
     const char *channel = (to && to[0]) ? to : (ctx->channel_id ? ctx->channel_id : "");
 
     size_t body_cap = (strlen(channel) + strlen(text)) * 2 + 160;
@@ -662,7 +674,7 @@ static bool slack_send(nc_channel *self, const char *to, const char *text) {
     nc_jw_str(&w, "text", text);
     nc_jw_obj_close(&w);
 
-    char *auth = nc_format("%s%s", "Authorization: Bearer ", ctx->token ? ctx->token : "");
+    char *auth = build_bearer_auth(ctx->token);
     if (!auth) {
         free(body);
         return false;
@@ -697,8 +709,9 @@ static void slack_free(nc_channel *self) {
 
 nc_channel nc_channel_slack(const char *bot_token) {
     slack_ctx *ctx = (slack_ctx *)calloc(1, sizeof(slack_ctx));
-    if (ctx)
-        ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
+    if (!ctx)
+        return (nc_channel){ .name = "slack", .ctx = NULL, .poll = slack_poll, .send = slack_send, .free = slack_free };
+    ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
 
     const char *ch = getenv("NOCLAW_SLACK_CHANNEL");
     if (ctx && ch)

@@ -54,6 +54,10 @@ static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ..
     return off;
 }
 
+static char *build_bearer_auth(const char *token) {
+    return nc_format("%s%s", "Authorization: Bearer ", token ? token : "");
+}
+
 static bool json_array_complete(const char *s) {
     if (!s) return false;
     size_t n = strlen(s);
@@ -270,7 +274,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     char *auth_hdr = NULL;
     if (ctx->api_key && ctx->api_key[0]) {
-        auth_hdr = nc_format("%s%s", "Authorization: Bearer ", ctx->api_key);
+        auth_hdr = build_bearer_auth(ctx->api_key);
         if (!auth_hdr) {
             free(msgs_json);
             free(body);
@@ -458,7 +462,7 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     char *auth_hdr = NULL;
     if (ctx->api_key && ctx->api_key[0]) {
-        auth_hdr = nc_format("%s%s", "Authorization: Bearer ", ctx->api_key);
+        auth_hdr = build_bearer_auth(ctx->api_key);
         if (!auth_hdr) {
             free(msgs_json);
             free(body);
