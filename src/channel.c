@@ -535,7 +535,7 @@ nc_channel nc_channel_discord(const char *bot_token) {
 
     /* Channel ID from env or will be set from first incoming message */
     const char *ch = getenv("NOCLAW_DISCORD_CHANNEL");
-    if (ctx && ch)
+    if (ch)
         ctx->channel_id = nc_strdup(ch);
 
     return (nc_channel){
@@ -714,7 +714,7 @@ nc_channel nc_channel_slack(const char *bot_token) {
     ctx->token = bot_token ? nc_strdup(bot_token) : NULL;
 
     const char *ch = getenv("NOCLAW_SLACK_CHANNEL");
-    if (ctx && ch)
+    if (ch)
         ctx->channel_id = nc_strdup(ch);
 
     return (nc_channel){
