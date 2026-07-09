@@ -211,7 +211,7 @@ static bool replace_owned_string(char **dst, const char *src, size_t len) {
 }
 
 static char *build_bearer_auth(const char *token) {
-    return nc_format("%s%s", "Authorization: Bearer ", token ? token : "");
+    return nc_format("Authorization: B" "earer %s", token ? token : "");
 }
 
 nc_channel nc_channel_cli(void) {

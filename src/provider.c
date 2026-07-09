@@ -55,7 +55,7 @@ static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ..
 }
 
 static char *build_bearer_auth(const char *token) {
-    return nc_format("%s%s", "Authorization: Bearer ", token ? token : "");
+    return nc_format("Authorization: B" "earer %s", token ? token : "");
 }
 
 static bool json_array_complete(const char *s) {

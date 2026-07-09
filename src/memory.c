@@ -185,7 +185,12 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
     }
     size_t new_cap = flen + eklen + eclen + 128;
     char *out = (char *)malloc(new_cap);
-    if (!out) { free(data); free(esc_key); free(esc_content); return false; }
+    if (!out) {
+        free(data);
+        free(esc_key);
+        free(esc_content);
+        return false;
+    }
 
     size_t out_len = 0;
 
@@ -387,7 +392,11 @@ static bool flat_forget(nc_memory *self, const char *key) {
     size_t eklen = strlen(esc_key);
 
     char *out = (char *)malloc(flen + 1);
-    if (!out) { free(data); free(esc_key); return false; }
+    if (!out) {
+        free(data);
+        free(esc_key);
+        return false;
+    }
 
     size_t out_len = 0;
     char *line = data;
