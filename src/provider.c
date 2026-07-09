@@ -270,7 +270,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     char *auth_hdr = NULL;
     if (ctx->api_key && ctx->api_key[0]) {
-        auth_hdr = nc_format("Authorization: ******", ctx->api_key);
+        auth_hdr = nc_format("%s%s", "Authorization: Bearer ", ctx->api_key);
         if (!auth_hdr) {
             free(msgs_json);
             free(body);
@@ -290,7 +290,6 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
         return false;
     }
 
-    bool result = false;
     bool result = false;
     nc_http_response http_resp;
     if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {
@@ -459,7 +458,7 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     char *auth_hdr = NULL;
     if (ctx->api_key && ctx->api_key[0]) {
-        auth_hdr = nc_format("Authorization: ******", ctx->api_key);
+        auth_hdr = nc_format("%s%s", "Authorization: Bearer ", ctx->api_key);
         if (!auth_hdr) {
             free(msgs_json);
             free(body);
@@ -478,7 +477,6 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
         return false;
     }
 
-    bool result = false;
     bool result = false;
     nc_http_response http_resp;
     if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {

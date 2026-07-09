@@ -127,11 +127,6 @@ static nc_extract_status extract_json_string2(const char *json,
     return s.len > cplen ? NC_EXTRACT_TRUNCATED : NC_EXTRACT_OK;
 }
 
-static bool extract_json_string(const char *json, const char *key,
-                                char *out, size_t out_cap) {
-    return extract_json_string2(json, key, out, out_cap, NULL) == NC_EXTRACT_OK;
-}
-
 static char *extract_json_string_dup(const char *json, const char *key) {
     size_t full_len = 0;
     nc_extract_status st = extract_json_string2(json, key, NULL, 0, &full_len);

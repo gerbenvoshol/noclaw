@@ -567,7 +567,7 @@ static bool slack_poll(nc_channel *self, nc_incoming_msg *out) {
                     ctx->channel_id, ctx->last_ts)
         : nc_format("https://slack.com/api/conversations.history?channel=%s&limit=1",
                     ctx->channel_id);
-    char *auth = nc_format("Authorization: ******", ctx->token ? ctx->token : "");
+    char *auth = nc_format("%s%s", "Authorization: Bearer ", ctx->token ? ctx->token : "");
     if (!url || !auth) {
         free(url);
         free(auth);
@@ -662,7 +662,7 @@ static bool slack_send(nc_channel *self, const char *to, const char *text) {
     nc_jw_str(&w, "text", text);
     nc_jw_obj_close(&w);
 
-    char *auth = nc_format("Authorization: ******", ctx->token ? ctx->token : "");
+    char *auth = nc_format("%s%s", "Authorization: Bearer ", ctx->token ? ctx->token : "");
     if (!auth) {
         free(body);
         return false;
