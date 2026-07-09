@@ -17,8 +17,8 @@
 /* ── Shared helpers ───────────────────────────────────────────── */
 
 typedef struct {
-    char api_key[256];
-    char api_url[256];
+    char *api_key;
+    char *api_url;
 } provider_ctx;
 
 /* Escape a string for JSON, writing into buf+off. Returns new offset. */
@@ -239,7 +239,8 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
      * This covers https://api.openai.com, https://api.openai.com/v1, and any
      * other path under that host. */
     static const char openai_prefix[] = "https://api.openai.com";
-    bool direct_openai = (strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0);
+    bool direct_openai = (ctx->api_url &&
+                          strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0);
     const char *tokens_key = direct_openai ? "max_completion_tokens" : "max_tokens";
 
     int off = 0;
@@ -267,20 +268,29 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
     headers[0] = "Content-Type: application/json";
 
-    char auth_hdr[1200];
-    if (ctx->api_key[0]) {
-        snprintf(auth_hdr, sizeof(auth_hdr),
-                 "Authorization: Bearer %s", ctx->api_key);
+    char *auth_hdr = NULL;
+    if (ctx->api_key && ctx->api_key[0]) {
+        auth_hdr = nc_format("Authorization: ******", ctx->api_key);
+        if (!auth_hdr) {
+            free(msgs_json);
+            free(body);
+            return false;
+        }
         headers[header_count++] = auth_hdr;
     }
 
     /* URL */
-    char url[1536];
-    if (ctx->api_url[0])
-        snprintf(url, sizeof(url), "%s/chat/completions", ctx->api_url);
-    else
-        snprintf(url, sizeof(url), "https://openrouter.ai/api/v1/chat/completions");
+    char *url = ctx->api_url && ctx->api_url[0]
+        ? nc_format("%s/chat/completions", ctx->api_url)
+        : nc_strdup("https://openrouter.ai/api/v1/chat/completions");
+    if (!url) {
+        free(auth_hdr);
+        free(msgs_json);
+        free(body);
+        return false;
+    }
 
+    bool result = false;
     bool result = false;
     nc_http_response http_resp;
     if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {
@@ -353,12 +363,19 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
 cleanup:
     nc_http_response_free(&http_resp);
+    free(auth_hdr);
+    free(url);
     free(msgs_json);
     free(body);
     return result;
 }
 
 static void provider_free(nc_provider *self) {
+    provider_ctx *ctx = (provider_ctx *)self->ctx;
+    if (ctx) {
+        free(ctx->api_key);
+        free(ctx->api_url);
+    }
     free(self->ctx);
     self->ctx = NULL;
 }
@@ -440,18 +457,28 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
     int header_count = 1;
     headers[0] = "Content-Type: application/json";
 
-    char auth_hdr[1200];
-    if (ctx->api_key[0]) {
-        snprintf(auth_hdr, sizeof(auth_hdr), "Authorization: Bearer %s", ctx->api_key);
+    char *auth_hdr = NULL;
+    if (ctx->api_key && ctx->api_key[0]) {
+        auth_hdr = nc_format("Authorization: ******", ctx->api_key);
+        if (!auth_hdr) {
+            free(msgs_json);
+            free(body);
+            return false;
+        }
         headers[header_count++] = auth_hdr;
     }
 
-    char url[1536];
-    if (ctx->api_url[0])
-        snprintf(url, sizeof(url), "%s/chat/completions", ctx->api_url);
-    else
-        snprintf(url, sizeof(url), "https://generativelanguage.googleapis.com/v1beta/openai");
+    char *url = ctx->api_url && ctx->api_url[0]
+        ? nc_format("%s/chat/completions", ctx->api_url)
+        : nc_strdup("https://generativelanguage.googleapis.com/v1beta/openai");
+    if (!url) {
+        free(auth_hdr);
+        free(msgs_json);
+        free(body);
+        return false;
+    }
 
+    bool result = false;
     bool result = false;
     nc_http_response http_resp;
     if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {
@@ -515,6 +542,8 @@ static bool gemini_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
 
 cleanup:
     nc_http_response_free(&http_resp);
+    free(auth_hdr);
+    free(url);
     free(msgs_json);
     free(body);
     return result;
@@ -523,8 +552,8 @@ cleanup:
 nc_provider nc_provider_gemini(const char *api_key, const char *api_url) {
     provider_ctx *ctx = (provider_ctx *)calloc(1, sizeof(provider_ctx));
     if (!ctx) return (nc_provider){ .name = "gemini", .ctx = NULL, .chat = NULL, .free = NULL };
-    if (api_key) nc_strlcpy(ctx->api_key, api_key, sizeof(ctx->api_key));
-    if (api_url) nc_strlcpy(ctx->api_url, api_url, sizeof(ctx->api_url));
+    ctx->api_key = api_key ? nc_strdup(api_key) : NULL;
+    ctx->api_url = api_url ? nc_strdup(api_url) : NULL;
 
     return (nc_provider){
         .name = "gemini",
@@ -537,8 +566,8 @@ nc_provider nc_provider_gemini(const char *api_key, const char *api_url) {
 nc_provider nc_provider_openai(const char *api_key, const char *api_url) {
     provider_ctx *ctx = (provider_ctx *)calloc(1, sizeof(provider_ctx));
     if (!ctx) return (nc_provider){ .name = "openai", .ctx = NULL, .chat = NULL, .free = NULL };
-    if (api_key) nc_strlcpy(ctx->api_key, api_key, sizeof(ctx->api_key));
-    if (api_url) nc_strlcpy(ctx->api_url, api_url, sizeof(ctx->api_url));
+    ctx->api_key = api_key ? nc_strdup(api_key) : NULL;
+    ctx->api_url = api_url ? nc_strdup(api_url) : NULL;
 
     return (nc_provider){
         .name = "openai",
@@ -864,19 +893,29 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
     }
 
     /* Headers */
-    char auth_hdr[1200];
-    snprintf(auth_hdr, sizeof(auth_hdr), "x-api-key: %s", ctx->api_key);
+    char *auth_hdr = nc_format("x-api-key: %s", ctx->api_key ? ctx->api_key : "");
+    if (!auth_hdr) {
+        free(msgs_json);
+        free(tools_buf);
+        free(body);
+        return false;
+    }
     const char *headers[] = {
         "Content-Type: application/json",
         auth_hdr,
         "anthropic-version: 2023-06-01",
     };
 
-    char url[1536];
-    if (ctx->api_url[0])
-        snprintf(url, sizeof(url), "%s/messages", ctx->api_url);
-    else
-        snprintf(url, sizeof(url), "https://api.anthropic.com/v1/messages");
+    char *url = ctx->api_url && ctx->api_url[0]
+        ? nc_format("%s/messages", ctx->api_url)
+        : nc_strdup("https://api.anthropic.com/v1/messages");
+    if (!url) {
+        free(auth_hdr);
+        free(msgs_json);
+        free(tools_buf);
+        free(body);
+        return false;
+    }
 
     bool result = false;
     nc_http_response http_resp;
@@ -914,6 +953,8 @@ static bool anthropic_chat(nc_provider *self, const nc_chat_request *req, nc_cha
 
 cleanup:
     nc_http_response_free(&http_resp);
+    free(auth_hdr);
+    free(url);
     free(msgs_json);
     free(tools_buf);
     free(body);
@@ -923,8 +964,8 @@ cleanup:
 nc_provider nc_provider_anthropic(const char *api_key, const char *api_url) {
     provider_ctx *ctx = (provider_ctx *)calloc(1, sizeof(provider_ctx));
     if (!ctx) return (nc_provider){ .name = "anthropic", .ctx = NULL, .chat = NULL, .free = NULL };
-    if (api_key) nc_strlcpy(ctx->api_key, api_key, sizeof(ctx->api_key));
-    if (api_url) nc_strlcpy(ctx->api_url, api_url, sizeof(ctx->api_url));
+    ctx->api_key = api_key ? nc_strdup(api_key) : NULL;
+    ctx->api_url = api_url ? nc_strdup(api_url) : NULL;
 
     return (nc_provider){
         .name = "anthropic",

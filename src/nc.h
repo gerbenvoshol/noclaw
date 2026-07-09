@@ -393,6 +393,10 @@ int nc_cmd_doctor(int argc, char **argv);
 
 /* Safe string copy */
 size_t nc_strlcpy(char *dst, const char *src, size_t dstsize);
+char  *nc_strdup_n(const char *src, size_t len);
+char  *nc_strdup(const char *src);
+char  *nc_format(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
 
 /* Get $HOME */
 const char *nc_home_dir(void);

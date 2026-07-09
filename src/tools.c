@@ -132,6 +132,22 @@ static bool extract_json_string(const char *json, const char *key,
     return extract_json_string2(json, key, out, out_cap, NULL) == NC_EXTRACT_OK;
 }
 
+static char *extract_json_string_dup(const char *json, const char *key) {
+    size_t full_len = 0;
+    nc_extract_status st = extract_json_string2(json, key, NULL, 0, &full_len);
+    if (st == NC_EXTRACT_MISSING || st == NC_EXTRACT_INVALID_JSON)
+        return NULL;
+    char *out = (char *)malloc(full_len + 1);
+    if (!out)
+        return NULL;
+    st = extract_json_string2(json, key, out, full_len + 1, NULL);
+    if (st != NC_EXTRACT_OK) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
 static bool append_suffix(char *out, size_t out_cap, const char *suffix)
 {
     size_t total = strlen(out);
@@ -1468,15 +1484,18 @@ static bool memory_store_execute(nc_tool *self, const char *args_json, char *out
         return false;
     }
 
-    char key[256], content[4096];
-    if (!extract_json_string(args_json, "key", key, sizeof(key))) {
+    char *key = extract_json_string_dup(args_json, "key");
+    char *content = extract_json_string_dup(args_json, "content");
+    if (!key) {
         tool_debug("memory_store", "missing 'key' argument");
         nc_strlcpy(out, "error: missing 'key' argument", out_cap);
+        free(content);
         return false;
     }
-    if (!extract_json_string(args_json, "content", content, sizeof(content))) {
+    if (!content) {
         tool_debug("memory_store", "missing 'content' argument for key '%s'", key);
         nc_strlcpy(out, "error: missing 'content' argument", out_cap);
+        free(key);
         return false;
     }
 
@@ -1485,10 +1504,14 @@ static bool memory_store_execute(nc_tool *self, const char *args_json, char *out
     if (mem->store(mem, key, content)) {
         tool_debug("memory_store", "stored key '%s'", key);
         snprintf(out, out_cap, "Stored memory: %s", key);
+        free(key);
+        free(content);
         return true;
     }
     tool_debug("memory_store", "failed to store key '%s'", key);
     nc_strlcpy(out, "error: failed to store memory", out_cap);
+    free(key);
+    free(content);
     return false;
 }
 
@@ -1519,8 +1542,8 @@ static bool memory_recall_execute(nc_tool *self, const char *args_json, char *ou
         return false;
     }
 
-    char query[1024];
-    if (!extract_json_string(args_json, "query", query, sizeof(query))) {
+    char *query = extract_json_string_dup(args_json, "query");
+    if (!query) {
         tool_debug("memory_recall", "missing 'query' argument");
         nc_strlcpy(out, "error: missing 'query' argument", out_cap);
         return false;
@@ -1530,10 +1553,12 @@ static bool memory_recall_execute(nc_tool *self, const char *args_json, char *ou
 
     if (mem->recall(mem, query, out, out_cap)) {
         tool_debug("memory_recall", "recall returned success");
+        free(query);
         return true;
     }
     tool_debug("memory_recall", "no matches found for query: %s", query);
     nc_strlcpy(out, "No matching memories found.", out_cap);
+    free(query);
     return true;
 }
 
