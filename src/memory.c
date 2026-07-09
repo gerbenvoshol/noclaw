@@ -36,6 +36,7 @@ static void flat_escape(const char *in, char *out, size_t out_cap) {
 }
 
 static char *flat_escape_dup(const char *in) {
+    if (!in) return NULL;
     size_t len = strlen(in);
     size_t cap = len * 2 + 1;
     char *out = (char *)malloc(cap);

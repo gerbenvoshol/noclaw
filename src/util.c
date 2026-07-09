@@ -63,6 +63,8 @@ size_t nc_strlcpy(char *dst, const char *src, size_t dstsize) {
 }
 
 char *nc_strdup_n(const char *src, size_t len) {
+    if (!src)
+        return NULL;
     char *dst = (char *)malloc(len + 1);
     if (!dst) return NULL;
     if (len > 0)
