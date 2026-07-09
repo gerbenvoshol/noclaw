@@ -258,41 +258,53 @@ static bool shell_quote_single(char *dst, size_t dst_cap, const char *src)
 
 static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
-    char command[NC_SHELL_COMMAND_MAX];
-    char shell_cmd[NC_SHELL_COMMAND_MAX + PATH_MAX * 2 + 128];
+    char *command = NULL;
+    char *shell_cmd = NULL;
     char block_reason[128];
     size_t full_len = 0;
     nc_extract_status est;
+    FILE *fp = NULL;
+    bool ok = false;
 
     if (out_cap == 0)
         return false;
 
     out[0] = '\0';
 
-    est = extract_json_string2(args_json, "command", command, sizeof(command), &full_len);
+    est = extract_json_string2(args_json, "command", NULL, 0, &full_len);
     if (est == NC_EXTRACT_INVALID_JSON) {
         nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
-        return false;
+        goto cleanup;
     }
     if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'command' argument", out_cap);
-        return false;
+        goto cleanup;
     }
-    if (est == NC_EXTRACT_TRUNCATED) {
+    if (full_len >= NC_SHELL_COMMAND_MAX) {
         snprintf(out, out_cap,
                  "error: 'command' argument too long (%zu bytes, max %zu)",
-                 full_len, sizeof(command) - 1);
-        return false;
+                 full_len, (size_t)NC_SHELL_COMMAND_MAX - 1);
+        goto cleanup;
+    }
+    command = (char *)malloc(full_len + 1);
+    if (!command) {
+        nc_strlcpy(out, "error: out of memory", out_cap);
+        goto cleanup;
+    }
+    est = extract_json_string2(args_json, "command", command, full_len + 1, NULL);
+    if (est != NC_EXTRACT_OK) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        goto cleanup;
     }
 
     if (command[0] == '\0') {
         nc_strlcpy(out, "error: empty command", out_cap);
-        return false;
+        goto cleanup;
     }
 
     if (!shell_command_is_allowed(command, block_reason, sizeof(block_reason))) {
         snprintf(out, out_cap, "error: unsafe command rejected (%s)", block_reason);
-        return false;
+        goto cleanup;
     }
 
     tool_debug_preview("shell", "command", command, strlen(command));
@@ -301,38 +313,52 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
         char workspace[PATH_MAX];
         char quoted_workspace[PATH_MAX * 4 + 8];
         int n;
+        size_t shell_cmd_cap;
 
         if (!realpath(cfg->workspace_dir, workspace)) {
             nc_strlcpy(out, "error: invalid workspace path", out_cap);
-            return false;
+            goto cleanup;
         }
 
         if (!shell_quote_single(quoted_workspace, sizeof(quoted_workspace), workspace)) {
             nc_strlcpy(out, "error: workspace path too long", out_cap);
-            return false;
+            goto cleanup;
         }
 
-        n = snprintf(shell_cmd, sizeof(shell_cmd),
+        shell_cmd_cap = strlen(command) + strlen(quoted_workspace) + 32;
+        shell_cmd = (char *)malloc(shell_cmd_cap);
+        if (!shell_cmd) {
+            nc_strlcpy(out, "error: out of memory", out_cap);
+            goto cleanup;
+        }
+        n = snprintf(shell_cmd, shell_cmd_cap,
                      "cd %s && ( %s\n) 2>&1",
                      quoted_workspace, command);
-        if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
+        if (n < 0 || (size_t)n >= shell_cmd_cap) {
             nc_strlcpy(out, "error: command too long", out_cap);
-            return false;
+            goto cleanup;
         }
     } else {
-        int n = snprintf(shell_cmd, sizeof(shell_cmd), "( %s\n) 2>&1", command);
-        if (n < 0 || (size_t)n >= sizeof(shell_cmd)) {
+        size_t shell_cmd_cap = strlen(command) + 16;
+        int n;
+        shell_cmd = (char *)malloc(shell_cmd_cap);
+        if (!shell_cmd) {
+            nc_strlcpy(out, "error: out of memory", out_cap);
+            goto cleanup;
+        }
+        n = snprintf(shell_cmd, shell_cmd_cap, "( %s\n) 2>&1", command);
+        if (n < 0 || (size_t)n >= shell_cmd_cap) {
             nc_strlcpy(out, "error: command too long", out_cap);
-            return false;
+            goto cleanup;
         }
     }
 
-    FILE *fp = popen(shell_cmd, "r");
+    fp = popen(shell_cmd, "r");
     if (!fp) {
         snprintf(out, out_cap,
                  "error: failed to execute command: %s",
                  strerror(errno));
-        return false;
+        goto cleanup;
     }
 
     size_t total = 0;
@@ -349,12 +375,13 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
         append_suffix(out, out_cap, "\n[output truncated]");
 
     int status = pclose(fp);
+    fp = NULL;
 
     if (status == -1) {
         snprintf(out, out_cap,
                  "error: failed to close shell process: %s",
                  strerror(errno));
-        return false;
+        goto cleanup;
     }
 
     if (!WIFEXITED(status)) {
@@ -368,7 +395,7 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
         } else {
             append_suffix(out, out_cap, "\n[process terminated abnormally]");
         }
-        return false;
+        goto cleanup;
     }
 
     if (WEXITSTATUS(status) != 0) {
@@ -376,10 +403,17 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
         int n = snprintf(suffix, sizeof(suffix), "\n[exit code: %d]", WEXITSTATUS(status));
         if (n >= 0)
             append_suffix(out, out_cap, suffix);
-        return false;
+        goto cleanup;
     }
 
-    return true;
+    ok = true;
+
+cleanup:
+    if (fp)
+        pclose(fp);
+    free(shell_cmd);
+    free(command);
+    return ok;
 }
 
 nc_tool nc_tool_shell(const nc_config *cfg) {
@@ -523,35 +557,51 @@ nc_tool nc_tool_file_read(const nc_config *cfg) {
 
 static bool file_write_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
-    char path[1024], content[NC_FILE_CONTENT_MAX];
+    char path[1024];
+    char *content = NULL;
     char write_path[PATH_MAX];
     size_t content_len;
     size_t full_len = 0;
     nc_extract_status est;
+    bool ok = false;
 
     est = extract_json_string2(args_json, "path", path, sizeof(path), &full_len);
     if (est == NC_EXTRACT_INVALID_JSON) {
         nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
-        return false;
+        goto cleanup;
     }
     if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'path' argument", out_cap);
-        return false;
+        goto cleanup;
     }
     if (est == NC_EXTRACT_TRUNCATED) {
         snprintf(out, out_cap, "error: 'path' argument too long (%zu bytes, max %zu)",
                  full_len, sizeof(path) - 1);
-        return false;
+        goto cleanup;
     }
-    est = extract_json_string2(args_json, "content", content, sizeof(content), &full_len);
+    est = extract_json_string2(args_json, "content", NULL, 0, &full_len);
     if (est == NC_EXTRACT_MISSING) {
         nc_strlcpy(out, "error: missing 'content' argument", out_cap);
-        return false;
+        goto cleanup;
     }
-    if (est == NC_EXTRACT_TRUNCATED) {
+    if (est == NC_EXTRACT_INVALID_JSON) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        goto cleanup;
+    }
+    if (full_len >= NC_FILE_CONTENT_MAX) {
         snprintf(out, out_cap, "error: 'content' argument too long (%zu bytes, max %zu)",
-                 full_len, sizeof(content) - 1);
-        return false;
+                 full_len, (size_t)NC_FILE_CONTENT_MAX - 1);
+        goto cleanup;
+    }
+    content = (char *)malloc(full_len + 1);
+    if (!content) {
+        nc_strlcpy(out, "error: out of memory", out_cap);
+        goto cleanup;
+    }
+    est = extract_json_string2(args_json, "content", content, full_len + 1, NULL);
+    if (est != NC_EXTRACT_OK) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        goto cleanup;
     }
 
     content_len = strlen(content);
@@ -560,32 +610,32 @@ static bool file_write_execute(nc_tool *self, const char *args_json, char *out, 
     if (cfg->workspace_only) {
         if (path[0] == '/') {
             nc_strlcpy(out, "error: absolute paths not allowed in workspace mode", out_cap);
-            return false;
+            goto cleanup;
         }
 
         if (!path_is_safe_relative(path)) {
             nc_strlcpy(out, "error: path traversal not allowed", out_cap);
-            return false;
+            goto cleanup;
         }
 
         if (!nc_path_join(write_path, sizeof(write_path), cfg->workspace_dir, path)) {
             nc_strlcpy(out, "error: path too long", out_cap);
-            return false;
+            goto cleanup;
         }
     } else {
         if (path[0] == '/') {
             if (nc_strlcpy(write_path, path, sizeof(write_path)) >= sizeof(write_path)) {
                 nc_strlcpy(out, "error: path too long", out_cap);
-                return false;
+                goto cleanup;
             }
         } else {
             if (!path_is_safe_relative(path)) {
                 nc_strlcpy(out, "error: path traversal not allowed", out_cap);
-                return false;
+                goto cleanup;
             }
             if (nc_strlcpy(write_path, path, sizeof(write_path)) >= sizeof(write_path)) {
                 nc_strlcpy(out, "error: path too long", out_cap);
-                return false;
+                goto cleanup;
             }
         }
     }
@@ -596,7 +646,7 @@ static bool file_write_execute(nc_tool *self, const char *args_json, char *out, 
 
         if (nc_strlcpy(dirbuf, write_path, sizeof(dirbuf)) >= sizeof(dirbuf)) {
             nc_strlcpy(out, "error: path too long", out_cap);
-            return false;
+            goto cleanup;
         }
 
         slash = strrchr(dirbuf, '/');
@@ -604,18 +654,21 @@ static bool file_write_execute(nc_tool *self, const char *args_json, char *out, 
             *slash = '\0';
             if (dirbuf[0] != '\0' && !nc_mkdir_p(dirbuf)) {
                 snprintf(out, out_cap, "error: failed to create parent directories for '%s'", path);
-                return false;
+                goto cleanup;
             }
         }
     }
 
     if (nc_write_file(write_path, content, content_len)) {
         snprintf(out, out_cap, "Written %zu bytes to %s", content_len, write_path);
-        return true;
+        ok = true;
     } else {
         snprintf(out, out_cap, "error: failed to write '%s'", path);
-        return false;
     }
+
+cleanup:
+    free(content);
+    return ok;
 }
 
 nc_tool nc_tool_file_write(const nc_config *cfg) {
@@ -1281,43 +1334,51 @@ static bool apply_patch_execute(nc_tool *self,
                                 size_t out_cap)
 {
     const nc_config *cfg = (const nc_config *)self->ctx;
-    char patch_input[NC_PATCH_INPUT_MAX];
+    char *patch_input = NULL;
     size_t patch_full_len = 0;
-    char normalized_patch[NC_PATCH_INPUT_MAX];
+    char *normalized_patch = NULL;
     nc_extract_status patch_st;
     char workspace[PATH_MAX];
     char tmp_template[PATH_MAX];
-    int fd;
+    int fd = -1;
+    bool ok = false;
 
     tool_debug("apply_patch", "request received");
 
     if (out_cap == 0)
         return false;
     out[0] = '\0';
+    tmp_template[0] = '\0';
 
-    patch_st = extract_json_string2(args_json,
-                                    "patch",
-                                    patch_input,
-                                    sizeof(patch_input),
-                                    &patch_full_len);
+    patch_st = extract_json_string2(args_json, "patch", NULL, 0, &patch_full_len);
     if (patch_st == NC_EXTRACT_INVALID_JSON) {
         nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
-        return false;
+        goto cleanup;
     }
     if (patch_st == NC_EXTRACT_MISSING) {
         tool_debug("apply_patch", "missing 'patch' argument");
         nc_strlcpy(out, "error: missing 'patch' argument", out_cap);
-        return false;
+        goto cleanup;
     }
-    if (patch_st == NC_EXTRACT_EMPTY) {
-        nc_strlcpy(out, "error: empty patch", out_cap);
-        return false;
-    }
-    if (patch_st == NC_EXTRACT_TRUNCATED) {
+    if (patch_full_len >= NC_PATCH_INPUT_MAX) {
         snprintf(out, out_cap,
                  "error: 'patch' argument too long (%zu bytes, max %zu)",
-                 patch_full_len, sizeof(patch_input) - 1);
-        return false;
+                 patch_full_len, (size_t)NC_PATCH_INPUT_MAX - 1);
+        goto cleanup;
+    }
+    patch_input = (char *)malloc(patch_full_len + 1);
+    if (!patch_input) {
+        nc_strlcpy(out, "error: out of memory", out_cap);
+        goto cleanup;
+    }
+    patch_st = extract_json_string2(args_json,
+                                    "patch",
+                                    patch_input,
+                                    patch_full_len + 1,
+                                    NULL);
+    if (patch_st != NC_EXTRACT_OK) {
+        nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+        goto cleanup;
     }
 
     tool_debug("apply_patch", "patch payload size: %zu bytes", strlen(patch_input));
@@ -1325,17 +1386,24 @@ static bool apply_patch_execute(nc_tool *self,
 
     if (patch_input[0] == '\0') {
         nc_strlcpy(out, "error: empty patch", out_cap);
-        return false;
+        goto cleanup;
     }
 
     if (strncmp(patch_input, "*** Begin Patch", 15) == 0) {
+        normalized_patch = (char *)malloc(NC_PATCH_INPUT_MAX);
+        if (!normalized_patch) {
+            nc_strlcpy(out, "error: out of memory", out_cap);
+            goto cleanup;
+        }
         if (!convert_begin_patch_to_unified(patch_input,
                                             normalized_patch,
-                                            sizeof(normalized_patch))) {
+                                            NC_PATCH_INPUT_MAX)) {
             nc_strlcpy(out, "error: invalid Begin Patch format", out_cap);
-            return false;
+            goto cleanup;
         }
-        nc_strlcpy(patch_input, normalized_patch, sizeof(patch_input));
+        free(patch_input);
+        patch_input = normalized_patch;
+        normalized_patch = NULL;
         tool_debug("apply_patch", "converted Begin Patch format to unified diff");
         tool_debug_preview("apply_patch", "normalized patch preview", patch_input, strlen(patch_input));
     }
@@ -1344,7 +1412,7 @@ static bool apply_patch_execute(nc_tool *self,
         nc_strlcpy(out,
                    "error: apply_patch requires workspace mode",
                    out_cap);
-        return false;
+        goto cleanup;
     }
 
     if (!realpath(cfg->workspace_dir, workspace)) {
@@ -1353,21 +1421,22 @@ static bool apply_patch_execute(nc_tool *self,
                    cfg->workspace_dir,
                    strerror(errno));
         nc_strlcpy(out, "error: invalid workspace path", out_cap);
-        return false;
+        goto cleanup;
     }
 
     tool_debug("apply_patch", "resolved workspace: %s", workspace);
 
     if (!validate_patch_targets(workspace, patch_input, out, out_cap)) {
         tool_debug("apply_patch", "patch target validation failed: %s", out);
-        return false;
+        goto cleanup;
     }
 
     if (snprintf(tmp_template,
                  sizeof(tmp_template),
                  "%s/.noclaw_patch_XXXXXX",
-                 workspace) >= (int)sizeof(tmp_template)) {        nc_strlcpy(out, "error: workspace path too long", out_cap);
-        return false;
+                 workspace) >= (int)sizeof(tmp_template)) {
+        nc_strlcpy(out, "error: workspace path too long", out_cap);
+        goto cleanup;
     }
 
     fd = mkstemp(tmp_template);
@@ -1377,7 +1446,7 @@ static bool apply_patch_execute(nc_tool *self,
                    tmp_template,
                    strerror(errno));
         nc_strlcpy(out, "error: failed to create temp patch file", out_cap);
-        return false;
+        goto cleanup;
     }
     {
         size_t patch_len = strlen(patch_input);
@@ -1388,10 +1457,8 @@ static bool apply_patch_execute(nc_tool *self,
             if (n < 0) {
                 if (errno == EINTR)
                     continue;
-                close(fd);
-                unlink(tmp_template);
                 nc_strlcpy(out, "error: failed to write patch", out_cap);
-                return false;
+                goto cleanup;
             }
             written += (size_t)n;
         }
@@ -1399,29 +1466,27 @@ static bool apply_patch_execute(nc_tool *self,
         if (patch_len > 0 && patch_input[patch_len - 1] != '\n') {
             static const char newline = '\n';
             if (write(fd, &newline, 1) != 1) {
-                close(fd);
-                unlink(tmp_template);
                 nc_strlcpy(out, "error: failed to finalize patch", out_cap);
-                return false;
+                goto cleanup;
             }
         }
     }
 
     if (close(fd) != 0) {
-        unlink(tmp_template);
         nc_strlcpy(out, "error: failed to finalize patch", out_cap);
-        return false;
+        goto cleanup;
     }
+    fd = -1;
 
     {
         int status;
         if (!run_patch_command(workspace, tmp_template, out, out_cap, &status)) {
-            unlink(tmp_template);
-            return false;
+            goto cleanup;
         }
 
         if (unlink(tmp_template) != 0)
             tool_debug("apply_patch", "failed to remove temp patch file '%s': %s", tmp_template, strerror(errno));
+        tmp_template[0] = '\0';
 
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             if (!WIFEXITED(status)) {
@@ -1441,7 +1506,7 @@ static bool apply_patch_execute(nc_tool *self,
 
             if (!out[0])
                 nc_strlcpy(out, "error: patch failed", out_cap);
-            return false;
+            goto cleanup;
         }
     }
 
@@ -1449,7 +1514,16 @@ static bool apply_patch_execute(nc_tool *self,
         nc_strlcpy(out, "Patch applied successfully", out_cap);
 
     tool_debug("apply_patch", "patch applied successfully, output size: %zu bytes", strlen(out));
-    return true;
+    ok = true;
+
+cleanup:
+    if (fd >= 0)
+        close(fd);
+    if (tmp_template[0])
+        unlink(tmp_template);
+    free(normalized_patch);
+    free(patch_input);
+    return ok;
 }
 
 nc_tool nc_tool_apply_patch(const nc_config *cfg) {
