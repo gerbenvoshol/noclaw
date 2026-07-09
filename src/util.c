@@ -62,6 +62,44 @@ size_t nc_strlcpy(char *dst, const char *src, size_t dstsize) {
     return srclen;
 }
 
+char *nc_strdup_n(const char *src, size_t len) {
+    if (!src)
+        return NULL;
+    char *dst = (char *)malloc(len + 1);
+    if (!dst) return NULL;
+    if (len > 0)
+        memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+char *nc_strdup(const char *src) {
+    if (!src) return NULL;
+    return nc_strdup_n(src, strlen(src));
+}
+
+char *nc_format(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) {
+        va_end(ap2);
+        return NULL;
+    }
+
+    char *buf = (char *)malloc((size_t)needed + 1);
+    if (!buf) {
+        va_end(ap2);
+        return NULL;
+    }
+    vsnprintf(buf, (size_t)needed + 1, fmt, ap2);
+    va_end(ap2);
+    return buf;
+}
+
 /* ── Home directory ───────────────────────────────────────────── */
 
 const char *nc_home_dir(void) {

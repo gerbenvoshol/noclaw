@@ -142,6 +142,18 @@ void nc_test_tools(void)
         out, sizeof(out)),
         "apply_patch rejects unterminated Begin Patch format");
 
+    NC_ASSERT(ap.execute(&ap,
+        "{\"patch\":\"*** Begin Patch\\n*** Update File: sub/a.txt\\n@@ -1,2 +1,2 @@\\n hello\\n-WORLD\\n+world-again\\n*** End Patch\\n\"}",
+        out, sizeof(out)),
+        "apply_patch accepts Begin Patch format");
+
+    NC_ASSERT(fr.execute(&fr,
+        "{\"path\":\"sub/a.txt\"}",
+        out, sizeof(out)),
+        "file_read reads Begin Patch update");
+    NC_ASSERT(strstr(out, "world-again") != NULL,
+        "Begin Patch conversion updated content");
+
 
     {
         size_t cmd_len = NC_SHELL_COMMAND_MAX + 32;

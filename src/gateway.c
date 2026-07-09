@@ -49,25 +49,38 @@ static void send_json(int fd, int status, const char *json) {
 typedef struct {
     char method[8];
     char path[256];
-    char body[65536];
+    char *body;
     size_t body_len;
     char auth_header[1200];   /* Authorization: Bearer ... */
     char pairing_header[32];  /* X-Pairing-Code */
 } http_request;
 
 static bool parse_request(int fd, http_request *req) {
+    char *buf = NULL;
+    size_t buf_cap = 131072;
+    bool ok = false;
+
     memset(req, 0, sizeof(*req));
 
-    char buf[131072];
+    buf = (char *)malloc(buf_cap);
+    if (!buf)
+        return false;
+    req->body = (char *)malloc(1);
+    if (!req->body) {
+        free(buf);
+        return false;
+    }
+    req->body[0] = '\0';
+
     size_t total = 0;
-    while (total < sizeof(buf) - 1) {
-        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+    while (total < buf_cap - 1) {
+        ssize_t n = read(fd, buf + total, buf_cap - 1 - total);
         if (n <= 0) break;
         total += (size_t)n;
         buf[total] = '\0';
         if (strstr(buf, "\r\n\r\n")) break;
     }
-    if (total == 0) return false;
+    if (total == 0) goto cleanup;
 
     /* Parse request line */
     sscanf(buf, "%7s %255s", req->method, req->path);
@@ -111,8 +124,8 @@ static bool parse_request(int fd, http_request *req) {
         size_t body_so_far = (size_t)(buf + total - body_start);
 
         while (content_length > 0 && body_so_far < content_length
-               && total < sizeof(buf) - 1) {
-            ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+               && total < buf_cap - 1) {
+            ssize_t n = read(fd, buf + total, buf_cap - 1 - total);
             if (n <= 0) break;
             total += (size_t)n;
             buf[total] = '\0';
@@ -120,13 +133,27 @@ static bool parse_request(int fd, http_request *req) {
         }
 
         req->body_len = body_so_far;
-        if (req->body_len >= sizeof(req->body))
-            req->body_len = sizeof(req->body) - 1;
+        char *body = (char *)malloc(req->body_len + 1);
+        if (!body) {
+            req->body_len = 0;
+            goto cleanup;
+        }
+        free(req->body);
+        req->body = body;
         memcpy(req->body, body_start, req->body_len);
         req->body[req->body_len] = '\0';
     }
 
-    return true;
+    ok = true;
+
+cleanup:
+    if (!ok) {
+        free(req->body);
+        req->body = NULL;
+        req->body_len = 0;
+    }
+    free(buf);
+    return ok;
 }
 
 /* ── Constant-time string comparison (timing side-channel prevention) ── */
@@ -167,6 +194,7 @@ void nc_gateway_init(nc_gateway *gw, nc_config *cfg, nc_agent *agent) {
 
 static void handle_request(nc_gateway *gw, int client_fd) {
     http_request req;
+    memset(&req, 0, sizeof(req));
     if (!parse_request(client_fd, &req)) {
         close(client_fd);
         return;
@@ -175,6 +203,7 @@ static void handle_request(nc_gateway *gw, int client_fd) {
     /* GET /health — always public */
     if (strcmp(req.path, "/health") == 0 && strcmp(req.method, "GET") == 0) {
         send_json(client_fd, 200, "{\"status\":\"ok\",\"version\":\"" NC_VERSION "\"}");
+        free(req.body);
         close(client_fd);
         return;
     }
@@ -197,6 +226,7 @@ static void handle_request(nc_gateway *gw, int client_fd) {
                 "{\"token\":\"%s\"}", gw->bearer_token);
             send_json(client_fd, 200, resp_body);
         }
+        free(req.body);
         close(client_fd);
         return;
     }
@@ -208,6 +238,7 @@ static void handle_request(nc_gateway *gw, int client_fd) {
         snprintf(expected, sizeof(expected), "Bearer %s", gw->bearer_token);
         if (!gw->paired || !ct_str_eq(req.auth_header, expected)) {
             send_json(client_fd, 401, "{\"error\":\"unauthorized\"}");
+            free(req.body);
             close(client_fd);
             return;
         }
@@ -219,32 +250,65 @@ static void handle_request(nc_gateway *gw, int client_fd) {
         nc_str message = nc_json_str(nc_json_get(body, "message"), "");
 
         if (message.len > 0) {
-            char msg_buf[65536];
-            size_t cplen = message.len < sizeof(msg_buf) - 1 ? message.len : sizeof(msg_buf) - 1;
+            char *msg_buf = (char *)malloc(message.len + 1);
+            char *resp_buf = NULL;
+            size_t reply_len;
+            size_t resp_buf_cap;
+            size_t cplen;
+            if (!msg_buf) {
+                send_json(client_fd, 500, "{\"error\":\"out of memory\"}");
+                nc_arena_free(&a);
+                free(req.body);
+                close(client_fd);
+                return;
+            }
+            cplen = message.len;
             memcpy(msg_buf, message.ptr, cplen);
             msg_buf[cplen] = '\0';
 
             const char *reply = nc_agent_chat(gw->agent, msg_buf);
 
             /* Build JSON response */
-            char resp_buf[131072];
+            reply_len = reply ? strlen(reply) : 0;
+            if (reply_len > (SIZE_MAX - 64) / 6) {
+                free(msg_buf);
+                send_json(client_fd, 500, "{\"error\":\"response too large\"}");
+                nc_arena_free(&a);
+                free(req.body);
+                close(client_fd);
+                return;
+            }
+            resp_buf_cap = reply_len * 6 + 64;
+            resp_buf = (char *)malloc(resp_buf_cap);
+            if (!resp_buf) {
+                free(msg_buf);
+                send_json(client_fd, 500, "{\"error\":\"out of memory\"}");
+                nc_arena_free(&a);
+                free(req.body);
+                close(client_fd);
+                return;
+            }
             nc_jw w;
-            nc_jw_init(&w, resp_buf, sizeof(resp_buf));
+            nc_jw_init(&w, resp_buf, resp_buf_cap);
             nc_jw_obj_open(&w);
             nc_jw_str(&w, "response", reply ? reply : "");
             nc_jw_obj_close(&w);
             send_json(client_fd, 200, resp_buf);
+            free(resp_buf);
+            free(msg_buf);
         } else {
             send_json(client_fd, 400, "{\"error\":\"missing 'message' field\"}");
         }
 
         nc_arena_free(&a);
+        free(req.body);
         close(client_fd);
         return;
     }
 
     /* 404 */
     send_json(client_fd, 404, "{\"error\":\"not found\"}");
+    free(req.body);
     close(client_fd);
 }
 

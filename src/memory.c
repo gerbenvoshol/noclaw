@@ -35,6 +35,16 @@ static void flat_escape(const char *in, char *out, size_t out_cap) {
     out[j] = '\0';
 }
 
+static char *flat_escape_dup(const char *in) {
+    if (!in) return NULL;
+    size_t len = strlen(in);
+    size_t cap = len * 2 + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    flat_escape(in, out, cap);
+    return out;
+}
+
 static void flat_unescape(char *s) {
     char *r = s, *w = s;
     while (*r) {
@@ -122,19 +132,25 @@ static char *read_all(const char *path, size_t *out_len) {
 
 /* Write buffer to file atomically (write to .tmp, rename) */
 static bool write_all(const char *path, const char *data, size_t len) {
-    char tmp[520];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    char *tmp = nc_format("%s.tmp", path);
+    if (!tmp) return false;
 
     FILE *f = fopen(tmp, "w");
-    if (!f) return false;
+    if (!f) {
+        free(tmp);
+        return false;
+    }
 
     if (len > 0 && fwrite(data, 1, len, f) != len) {
         fclose(f);
         remove(tmp);
+        free(tmp);
         return false;
     }
     fclose(f);
-    return rename(tmp, path) == 0;
+    bool ok = rename(tmp, path) == 0;
+    free(tmp);
+    return ok;
 }
 
 /* ── Store ───────────────────────────────────────────────────── */
@@ -146,9 +162,13 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
     time_t now = time(NULL);
 
     /* Escape key and content so tabs/newlines don't break the format */
-    char esc_key[1024], esc_content[8192];
-    flat_escape(key, esc_key, sizeof(esc_key));
-    flat_escape(content, esc_content, sizeof(esc_content));
+    char *esc_key = flat_escape_dup(key);
+    char *esc_content = flat_escape_dup(content);
+    if (!esc_key || !esc_content) {
+        free(esc_key);
+        free(esc_content);
+        return false;
+    }
     size_t eklen = strlen(esc_key);
     size_t eclen = strlen(esc_content);
 
@@ -160,11 +180,18 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
     if (flen > SIZE_MAX - eklen - eclen - 128) {
         nc_log(NC_LOG_ERROR, "memory_store failed: entry too large");
         free(data);
+        free(esc_key);
+        free(esc_content);
         return false;
     }
     size_t new_cap = flen + eklen + eclen + 128;
     char *out = (char *)malloc(new_cap);
-    if (!out) { free(data); return false; }
+    if (!out) {
+        free(data);
+        free(esc_key);
+        free(esc_content);
+        return false;
+    }
 
     size_t out_len = 0;
 
@@ -186,6 +213,8 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
                     nc_log(NC_LOG_ERROR, "memory_store failed: rebuilt memory data exceeded buffer");
                     free(out);
                     free(data);
+                    free(esc_key);
+                    free(esc_content);
                     return false;
                 }
                 memcpy(out + out_len, line, llen);
@@ -205,6 +234,8 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
         nc_log(NC_LOG_ERROR, "memory_store failed: formatted entry exceeded buffer");
         free(out);
         free(data);
+        free(esc_key);
+        free(esc_content);
         return false;
     }
     out_len += (size_t)n;
@@ -213,6 +244,8 @@ static bool flat_store(nc_memory *self, const char *key, const char *content) {
 
     free(out);
     free(data);
+    free(esc_key);
+    free(esc_content);
     return ok;
 }
 
@@ -293,20 +326,24 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
     size_t off = 0;
     int count = 0;
     for (int i = 0; i < 5 && top[i].score > 0; i++) {
-        char key_buf[1024], content_buf[8192];
-        size_t kl = top[i].klen < sizeof(key_buf) - 1 ? top[i].klen : sizeof(key_buf) - 1;
-        memcpy(key_buf, top[i].key, kl);
-        key_buf[kl] = '\0';
+        char *key_buf = nc_strdup_n(top[i].key, top[i].klen);
+        char *content_buf = nc_strdup_n(top[i].content, top[i].clen);
+        if (!key_buf || !content_buf) {
+            free(key_buf);
+            free(content_buf);
+            break;
+        }
         flat_unescape(key_buf);
 
-        size_t cl = top[i].clen < sizeof(content_buf) - 1 ? top[i].clen : sizeof(content_buf) - 1;
-        memcpy(content_buf, top[i].content, cl);
-        content_buf[cl] = '\0';
         flat_unescape(content_buf);
 
         char line_buf[NC_RECALL_LINE_MAX];
         int n = snprintf(line_buf, sizeof(line_buf), "[%s] %s\n", key_buf, content_buf);
-        if (n < 0) continue;
+        if (n < 0) {
+            free(key_buf);
+            free(content_buf);
+            continue;
+        }
         size_t line_len = (size_t)n < sizeof(line_buf) ? (size_t)n : sizeof(line_buf) - 1;
         size_t avail;
 
@@ -321,6 +358,8 @@ static bool flat_recall(nc_memory *self, const char *query, char *out, size_t ou
         off += line_len;
         out[off] = '\0';
         count++;
+        free(key_buf);
+        free(content_buf);
 
         if (avail == line_len)
             break;
@@ -346,12 +385,19 @@ static bool flat_forget(nc_memory *self, const char *key) {
     if (!data) return true;  /* nothing to forget */
 
     /* Escape key to match stored format */
-    char esc_key[1024];
-    flat_escape(key, esc_key, sizeof(esc_key));
+    char *esc_key = flat_escape_dup(key);
+    if (!esc_key) {
+        free(data);
+        return false;
+    }
     size_t eklen = strlen(esc_key);
 
     char *out = (char *)malloc(flen + 1);
-    if (!out) { free(data); return false; }
+    if (!out) {
+        free(data);
+        free(esc_key);
+        return false;
+    }
 
     size_t out_len = 0;
     char *line = data;
@@ -374,6 +420,7 @@ static bool flat_forget(nc_memory *self, const char *key) {
     bool ok = write_all(ctx->path, out, out_len);
     free(out);
     free(data);
+    free(esc_key);
     return ok;
 }
 
