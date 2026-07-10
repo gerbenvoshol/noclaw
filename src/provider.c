@@ -55,7 +55,7 @@ static int append_snprintf(char *buf, size_t bufsz, int off, const char *fmt, ..
 }
 
 static char *build_bearer_auth(const char *token) {
-    const char *fmt = "Authorization: ******";
+    const char *fmt = "Authorization: Bearer %s";
     return nc_format(fmt, token ? token : "");
 }
 
