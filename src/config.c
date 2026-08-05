@@ -22,6 +22,8 @@ void nc_config_defaults(nc_config *cfg) {
     /* Provider */
     nc_strlcpy(cfg->default_provider, "openrouter", sizeof(cfg->default_provider));
     nc_strlcpy(cfg->default_model, "anthropic/claude-sonnet-4", sizeof(cfg->default_model));
+    nc_strlcpy(cfg->api_mode, "auto", sizeof(cfg->api_mode));
+    nc_strlcpy(cfg->reasoning_effort, "none", sizeof(cfg->reasoning_effort));
     cfg->default_temperature = -1.0;  /* -1 = not set; provider uses its own default */
     cfg->max_tokens = 4096;
     cfg->http_timeout_seconds = 30;
@@ -102,6 +104,10 @@ bool nc_config_load(nc_config *cfg) {
         str_to_buf(cfg->default_provider, sizeof(cfg->default_provider), nc_json_str(v, "openrouter"));
     if ((v = nc_json_get(root, "default_model")))
         str_to_buf(cfg->default_model, sizeof(cfg->default_model), nc_json_str(v, ""));
+    if ((v = nc_json_get(root, "api_mode")))
+        str_to_buf(cfg->api_mode, sizeof(cfg->api_mode), nc_json_str(v, "auto"));
+    if ((v = nc_json_get(root, "reasoning_effort")))
+        str_to_buf(cfg->reasoning_effort, sizeof(cfg->reasoning_effort), nc_json_str(v, "none"));
     if ((v = nc_json_get(root, "default_temperature")))
         cfg->default_temperature = nc_json_num(v, -1.0);
     if ((v = nc_json_get(root, "max_tokens")))
@@ -242,6 +248,10 @@ bool nc_config_save(const nc_config *cfg) {
         nc_jw_str(&w, "instructions_file", cfg->instructions_file);
     nc_jw_str(&w, "default_provider", cfg->default_provider);
     nc_jw_str(&w, "default_model", cfg->default_model);
+    if (cfg->api_mode[0] && strcmp(cfg->api_mode, "auto") != 0)
+        nc_jw_str(&w, "api_mode", cfg->api_mode);
+    if (cfg->reasoning_effort[0] && strcmp(cfg->reasoning_effort, "none") != 0)
+        nc_jw_str(&w, "reasoning_effort", cfg->reasoning_effort);
     if (cfg->default_temperature >= 0.0)
         nc_jw_num(&w, "default_temperature", cfg->default_temperature);
     nc_jw_num(&w, "max_tokens", cfg->max_tokens);
@@ -407,6 +417,10 @@ void nc_config_apply_env(nc_config *cfg) {
         nc_strlcpy(cfg->default_provider, v, sizeof(cfg->default_provider));
     if ((v = getenv("NOCLAW_MODEL")))
         nc_strlcpy(cfg->default_model, v, sizeof(cfg->default_model));
+    if ((v = getenv("NOCLAW_API_MODE")))
+        nc_strlcpy(cfg->api_mode, v, sizeof(cfg->api_mode));
+    if ((v = getenv("NOCLAW_REASONING_EFFORT")))
+        nc_strlcpy(cfg->reasoning_effort, v, sizeof(cfg->reasoning_effort));
     if ((v = getenv("NOCLAW_TEMPERATURE"))) {
         char *endp;
         double t = strtod(v, &endp);

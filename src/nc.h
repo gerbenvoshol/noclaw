@@ -154,6 +154,8 @@ typedef struct nc_config {
     char api_url[1024];
     char default_provider[64];
     char default_model[128];
+    char api_mode[16];          /* auto, chat, responses */
+    char reasoning_effort[16];  /* none, low, medium, high */
     double default_temperature;
     int max_tokens;
     int http_timeout_seconds;
@@ -256,7 +258,8 @@ struct nc_provider {
 };
 
 /* Provider constructors */
-nc_provider nc_provider_openai(const char *api_key, const char *api_url);
+nc_provider nc_provider_openai(const char *api_key, const char *api_url,
+                               const char *api_mode, const char *reasoning_effort);
 nc_provider nc_provider_anthropic(const char *api_key, const char *api_url);
 nc_provider nc_provider_gemini(const char *api_key, const char *api_url);
 

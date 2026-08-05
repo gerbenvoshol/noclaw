@@ -52,7 +52,8 @@ static nc_provider make_provider(const nc_config *cfg) {
         return nc_provider_anthropic(cfg->api_key, cfg->api_url);
     if (strcmp(cfg->default_provider, "gemini") == 0)
         return nc_provider_gemini(cfg->api_key, cfg->api_url);
-    return nc_provider_openai(cfg->api_key, cfg->api_url);
+    return nc_provider_openai(cfg->api_key, cfg->api_url,
+                              cfg->api_mode, cfg->reasoning_effort);
 }
 
 static void make_agent_stack(nc_config *cfg, nc_provider *prov, nc_memory *mem,

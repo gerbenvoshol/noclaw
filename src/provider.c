@@ -19,7 +19,19 @@
 typedef struct {
     char *api_key;
     char *api_url;
+    char *api_mode;
+    char *reasoning_effort;
 } provider_ctx;
+
+static bool is_direct_openai(provider_ctx *ctx) {
+    static const char openai_prefix[] = "https://api.openai.com";
+    return ctx && ctx->api_url &&
+           strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0;
+}
+
+static bool reasoning_is_none(const char *s) {
+    return !s || !s[0] || strcmp(s, "none") == 0;
+}
 
 /* Escape a string for JSON, writing into buf+off. Returns new offset. */
 static int json_escape_into(char *buf, size_t bufsz, int off, const char *s) {
@@ -93,6 +105,167 @@ static size_t estimate_messages_size(const nc_message *msgs, int count) {
         }
     }
     return sz;
+}
+
+static int append_json_str(char *buf, size_t bufsz, int off, const char *s) {
+    off = append_snprintf(buf, bufsz, off, "\"");
+    off = json_escape_into(buf, bufsz, off, s ? s : "");
+    return append_snprintf(buf, bufsz, off, "\"");
+}
+
+/* Responses API uses top-level function tools, not Chat Completions wrappers. */
+static char *openai_responses_tools_json(const char *tools_json) {
+    if (!tools_json) return NULL;
+
+    nc_arena a;
+    nc_arena_init(&a, strlen(tools_json) * 2 + 1024);
+    nc_json *arr = nc_json_parse(&a, tools_json, strlen(tools_json));
+    if (!arr || arr->type != NC_JSON_ARRAY) { nc_arena_free(&a); return NULL; }
+
+    size_t out_sz = strlen(tools_json) + 4096;
+    char *out = (char *)malloc(out_sz);
+    if (!out) { nc_arena_free(&a); return NULL; }
+
+    int off = 0;
+    off = append_snprintf(out, out_sz, off, "[");
+    for (int i = 0; i < arr->array.count; i++) {
+        nc_json *tool = &arr->array.items[i];
+        nc_json *fn = nc_json_get(tool, "function");
+        if (!fn) continue;
+        if (i > 0) off = append_snprintf(out, out_sz, off, ",");
+
+        nc_str name = nc_json_str(nc_json_get(fn, "name"), "");
+        nc_str desc = nc_json_str(nc_json_get(fn, "description"), "");
+        nc_json *params = nc_json_get(fn, "parameters");
+        nc_str params_raw = nc_json_get_slice(arr, params);
+
+        char name_tmp[128], desc_tmp[512];
+        size_t n = name.len < sizeof(name_tmp) - 1 ? name.len : sizeof(name_tmp) - 1;
+        if (n && name.ptr)
+            memcpy(name_tmp, name.ptr, n);
+        name_tmp[n] = '\0';
+        n = desc.len < sizeof(desc_tmp) - 1 ? desc.len : sizeof(desc_tmp) - 1;
+        if (n && desc.ptr)
+            memcpy(desc_tmp, desc.ptr, n);
+        desc_tmp[n] = '\0';
+
+        off = append_snprintf(out, out_sz, off, "{\"type\":\"function\",\"name\":");
+        off = append_json_str(out, out_sz, off, name_tmp);
+        off = append_snprintf(out, out_sz, off, ",\"description\":");
+        off = append_json_str(out, out_sz, off, desc_tmp);
+        off = append_snprintf(out, out_sz, off, ",\"parameters\":");
+        if (params_raw.ptr && params_raw.len > 0)
+            off = append_snprintf(out, out_sz, off, "%.*s", NC_STR_ARG(params_raw));
+        else
+            off = append_snprintf(out, out_sz, off, "{\"type\":\"object\"}");
+        off = append_snprintf(out, out_sz, off, "}");
+    }
+    off = append_snprintf(out, out_sz, off, "]");
+
+    if (off < 0 || (size_t)off >= out_sz || !json_array_complete(out)) {
+        free(out);
+        out = NULL;
+    }
+    nc_arena_free(&a);
+    return out;
+}
+
+static int openai_build_responses_input(char *buf, size_t bufsz,
+                                        const nc_message *msgs, int count) {
+    int off = 0;
+    bool first = true;
+    off = append_snprintf(buf, bufsz, off, "[");
+
+    for (int i = 0; i < count; i++) {
+        if ((size_t)off >= bufsz - 10) break;
+
+        if (msgs[i].tool_call_count > 0) {
+            if (msgs[i].content && msgs[i].content[0]) {
+                if (!first) off = append_snprintf(buf, bufsz, off, ",");
+                first = false;
+                off = append_snprintf(buf, bufsz, off, "{\"role\":\"assistant\",\"content\":");
+                off = append_json_str(buf, bufsz, off, msgs[i].content);
+                off = append_snprintf(buf, bufsz, off, "}");
+            }
+            for (int j = 0; j < msgs[i].tool_call_count; j++) {
+                const nc_tool_call *tc = &msgs[i].tool_calls[j];
+                if (!first) off = append_snprintf(buf, bufsz, off, ",");
+                first = false;
+                off = append_snprintf(buf, bufsz, off, "{\"type\":\"function_call\",\"call_id\":");
+                off = append_json_str(buf, bufsz, off, tc->id);
+                off = append_snprintf(buf, bufsz, off, ",\"name\":");
+                off = append_json_str(buf, bufsz, off, tc->name);
+                off = append_snprintf(buf, bufsz, off, ",\"arguments\":");
+                off = append_json_str(buf, bufsz, off, tc->arguments);
+                off = append_snprintf(buf, bufsz, off, "}");
+            }
+        } else if (msgs[i].tool_call_id && msgs[i].tool_call_id[0]) {
+            if (!first) off = append_snprintf(buf, bufsz, off, ",");
+            first = false;
+            off = append_snprintf(buf, bufsz, off, "{\"type\":\"function_call_output\",\"call_id\":");
+            off = append_json_str(buf, bufsz, off, msgs[i].tool_call_id);
+            off = append_snprintf(buf, bufsz, off, ",\"output\":");
+            off = append_json_str(buf, bufsz, off, msgs[i].content);
+            off = append_snprintf(buf, bufsz, off, "}");
+        } else {
+            if (!first) off = append_snprintf(buf, bufsz, off, ",");
+            first = false;
+            off = append_snprintf(buf, bufsz, off, "{\"role\":\"%s\",\"content\":", msgs[i].role);
+            off = append_json_str(buf, bufsz, off, msgs[i].content);
+            off = append_snprintf(buf, bufsz, off, "}");
+        }
+    }
+
+    return append_snprintf(buf, bufsz, off, "]");
+}
+
+static void responses_parse_tool_call(nc_json *item, nc_chat_response *resp) {
+    if (!item || resp->tool_call_count >= NC_MAX_TOOL_CALLS) return;
+    nc_str type = nc_json_str(nc_json_get(item, "type"), "");
+    if (!nc_str_eql(type, "function_call")) return;
+
+    nc_tool_call *out = &resp->tool_calls[resp->tool_call_count];
+    memset(out, 0, sizeof(*out));
+
+    nc_str id = nc_json_str(nc_json_get(item, "call_id"), "");
+    if (id.len == 0) id = nc_json_str(nc_json_get(item, "id"), "");
+    size_t cl = id.len < sizeof(out->id) - 1 ? id.len : sizeof(out->id) - 1;
+    if (cl > 0 && id.ptr) memcpy(out->id, id.ptr, cl);
+    out->id[cl] = '\0';
+    if (!out->id[0]) snprintf(out->id, sizeof(out->id), "call_%d", resp->tool_call_count + 1);
+
+    nc_str name = nc_json_str(nc_json_get(item, "name"), "");
+    cl = name.len < sizeof(out->name) - 1 ? name.len : sizeof(out->name) - 1;
+    if (cl > 0 && name.ptr) memcpy(out->name, name.ptr, cl);
+    out->name[cl] = '\0';
+
+    nc_str args = nc_json_str(nc_json_get(item, "arguments"), "{}");
+    cl = args.len < sizeof(out->arguments) - 1 ? args.len : sizeof(out->arguments) - 1;
+    if (cl > 0 && args.ptr) memcpy(out->arguments, args.ptr, cl);
+    out->arguments[cl] = '\0';
+    out->arguments_len = args.len;
+    out->arguments_truncated = (cl < args.len);
+
+    resp->tool_call_count++;
+    resp->has_tool_calls = true;
+}
+
+static void responses_parse_message_text(nc_json *msg, nc_chat_response *resp) {
+    nc_json *content = nc_json_get(msg, "content");
+    if (!content || content->type != NC_JSON_ARRAY) return;
+    for (int i = 0; i < content->array.count; i++) {
+        nc_json *part = &content->array.items[i];
+        nc_str type = nc_json_str(nc_json_get(part, "type"), "");
+        if (nc_str_eql(type, "output_text") || nc_str_eql(type, "text")) {
+            nc_str text = nc_json_str(nc_json_get(part, "text"), "");
+            size_t have = strlen(resp->content);
+            if (have < sizeof(resp->content) - 1 && text.ptr && text.len) {
+                size_t cl = text.len < sizeof(resp->content) - 1 - have ? text.len : sizeof(resp->content) - 1 - have;
+                memcpy(resp->content + have, text.ptr, cl);
+                resp->content[have + cl] = '\0';
+            }
+        }
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -211,7 +384,7 @@ static void openai_parse_tool_calls(nc_json *tc_arr, nc_chat_response *resp) {
     resp->has_tool_calls = resp->tool_call_count > 0;
 }
 
-static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_response *resp) {
+static bool openai_chat_completions(nc_provider *self, const nc_chat_request *req, nc_chat_response *resp) {
     provider_ctx *ctx = (provider_ctx *)self->ctx;
     memset(resp, 0, sizeof(*resp));
 
@@ -243,9 +416,7 @@ static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_r
      * Match the full scheme+host prefix to avoid subdomain spoofing.
      * This covers https://api.openai.com, https://api.openai.com/v1, and any
      * other path under that host. */
-    static const char openai_prefix[] = "https://api.openai.com";
-    bool direct_openai = (ctx->api_url &&
-                          strncmp(ctx->api_url, openai_prefix, sizeof(openai_prefix) - 1) == 0);
+    bool direct_openai = is_direct_openai(ctx);
     const char *tokens_key = direct_openai ? "max_completion_tokens" : "max_tokens";
 
     int off = 0;
@@ -374,11 +545,147 @@ cleanup:
     return result;
 }
 
+
+static bool openai_chat_responses(nc_provider *self, const nc_chat_request *req, nc_chat_response *resp) {
+    provider_ctx *ctx = (provider_ctx *)self->ctx;
+    memset(resp, 0, sizeof(*resp));
+
+    size_t input_est = estimate_messages_size(req->messages, req->message_count) * 2 + 4096;
+    char *input_json = (char *)malloc(input_est);
+    if (!input_json) return false;
+    openai_build_responses_input(input_json, input_est, req->messages, req->message_count);
+    if (!json_array_complete(input_json)) {
+        nc_log(NC_LOG_ERROR, "OpenAI Responses input JSON was truncated");
+        free(input_json);
+        return false;
+    }
+
+    char *tools_json = openai_responses_tools_json(req->tools_json);
+    if (req->tools_json && !tools_json) {
+        nc_log(NC_LOG_ERROR, "OpenAI Responses tools JSON conversion failed");
+        free(input_json);
+        return false;
+    }
+
+    size_t body_sz = strlen(input_json) + strlen(req->model) + 4096 +
+                     (tools_json ? strlen(tools_json) : 0);
+    char *body = (char *)malloc(body_sz);
+    if (!body) { free(input_json); free(tools_json); return false; }
+
+    int off = 0;
+    off = append_snprintf(body, body_sz, off, "{\"model\":\"%s\",\"input\":%s", req->model, input_json);
+    if (req->temperature >= 0.0)
+        off = append_snprintf(body, body_sz, off, ",\"temperature\":%.2f", req->temperature);
+    off = append_snprintf(body, body_sz, off, ",\"max_output_tokens\":%d",
+        req->max_tokens > 0 ? req->max_tokens : 4096);
+    if (!reasoning_is_none(ctx->reasoning_effort))
+        off = append_snprintf(body, body_sz, off, ",\"reasoning\":{\"effort\":\"%s\"}", ctx->reasoning_effort);
+    if (tools_json)
+        off = append_snprintf(body, body_sz, off, ",\"tools\":%s", tools_json);
+    off = append_snprintf(body, body_sz, off, "}");
+    int body_len = off;
+
+    if (body_len < 0 || (size_t)body_len >= body_sz || !json_object_complete(body)) {
+        nc_log(NC_LOG_ERROR, "OpenAI Responses request body exceeded buffer");
+        free(input_json); free(tools_json); free(body);
+        return false;
+    }
+
+    const char *headers[2];
+    int header_count = 1;
+    headers[0] = "Content-Type: application/json";
+
+    char *auth_hdr = NULL;
+    if (ctx->api_key && ctx->api_key[0]) {
+        auth_hdr = build_bearer_auth(ctx->api_key);
+        if (!auth_hdr) { free(input_json); free(tools_json); free(body); return false; }
+        headers[header_count++] = auth_hdr;
+    }
+
+    char *url = ctx->api_url && ctx->api_url[0]
+        ? nc_format("%s/responses", ctx->api_url)
+        : nc_strdup("https://api.openai.com/v1/responses");
+    if (!url) { free(auth_hdr); free(input_json); free(tools_json); free(body); return false; }
+
+    bool result = false;
+    nc_http_response http_resp;
+    if (!nc_http_post(url, body, (size_t)body_len, headers, header_count, &http_resp)) {
+        nc_log(NC_LOG_ERROR, "OpenAI Responses HTTP request failed");
+        goto cleanup;
+    }
+    if (http_resp.status != 200) {
+        nc_log(NC_LOG_ERROR, "OpenAI Responses returned HTTP %d: %.200s", http_resp.status, http_resp.body);
+        goto cleanup;
+    }
+
+    nc_arena a;
+    nc_arena_init(&a, http_resp.body_len * 2 + 1024);
+    nc_json *root = nc_json_parse(&a, http_resp.body, http_resp.body_len);
+    if (!root) {
+        nc_log(NC_LOG_ERROR, "Failed to parse OpenAI Responses response");
+        nc_arena_free(&a);
+        goto cleanup;
+    }
+
+    nc_json *output = nc_json_get(root, "output");
+    if (output && output->type == NC_JSON_ARRAY) {
+        for (int i = 0; i < output->array.count; i++) {
+            nc_json *item = &output->array.items[i];
+            nc_str type = nc_json_str(nc_json_get(item, "type"), "");
+            if (nc_str_eql(type, "function_call"))
+                responses_parse_tool_call(item, resp);
+            else if (nc_str_eql(type, "message"))
+                responses_parse_message_text(item, resp);
+        }
+    }
+
+    if (!resp->content[0]) {
+        nc_str text = nc_json_str(nc_json_get(root, "output_text"), "");
+        if (text.ptr && text.len) {
+            size_t cl = text.len < sizeof(resp->content) - 1 ? text.len : sizeof(resp->content) - 1;
+            memcpy(resp->content, text.ptr, cl);
+            resp->content[cl] = '\0';
+        }
+    }
+
+    nc_json *usage = nc_json_get(root, "usage");
+    if (usage) {
+        resp->prompt_tokens = (int)nc_json_num(nc_json_get(usage, "input_tokens"), 0);
+        resp->completion_tokens = (int)nc_json_num(nc_json_get(usage, "output_tokens"), 0);
+    }
+
+    nc_arena_free(&a);
+    result = true;
+
+cleanup:
+    nc_http_response_free(&http_resp);
+    free(auth_hdr);
+    free(url);
+    free(input_json);
+    free(tools_json);
+    free(body);
+    return result;
+}
+
+static bool openai_chat(nc_provider *self, const nc_chat_request *req, nc_chat_response *resp) {
+    provider_ctx *ctx = (provider_ctx *)self->ctx;
+    bool direct = is_direct_openai(ctx);
+    bool force_responses = ctx->api_mode && strcmp(ctx->api_mode, "responses") == 0;
+    bool force_chat = ctx->api_mode && strcmp(ctx->api_mode, "chat") == 0;
+    bool auto_responses = direct && req->tools_json && !reasoning_is_none(ctx->reasoning_effort);
+
+    if (force_responses || (!force_chat && auto_responses))
+        return openai_chat_responses(self, req, resp);
+    return openai_chat_completions(self, req, resp);
+}
+
 static void provider_free(nc_provider *self) {
     provider_ctx *ctx = (provider_ctx *)self->ctx;
     if (ctx) {
         free(ctx->api_key);
         free(ctx->api_url);
+        free(ctx->api_mode);
+        free(ctx->reasoning_effort);
     }
     free(self->ctx);
     self->ctx = NULL;
@@ -566,11 +873,14 @@ nc_provider nc_provider_gemini(const char *api_key, const char *api_url) {
     };
 }
 
-nc_provider nc_provider_openai(const char *api_key, const char *api_url) {
+nc_provider nc_provider_openai(const char *api_key, const char *api_url,
+                               const char *api_mode, const char *reasoning_effort) {
     provider_ctx *ctx = (provider_ctx *)calloc(1, sizeof(provider_ctx));
     if (!ctx) return (nc_provider){ .name = "openai", .ctx = NULL, .chat = NULL, .free = NULL };
     ctx->api_key = api_key ? nc_strdup(api_key) : NULL;
     ctx->api_url = api_url ? nc_strdup(api_url) : NULL;
+    ctx->api_mode = api_mode ? nc_strdup(api_mode) : nc_strdup("auto");
+    ctx->reasoning_effort = reasoning_effort ? nc_strdup(reasoning_effort) : nc_strdup("none");
 
     return (nc_provider){
         .name = "openai",
