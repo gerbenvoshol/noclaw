@@ -82,10 +82,11 @@ static size_t estimate_tools_json_size(nc_agent *agent) {
     size_t sz = 32;
     for (int i = 0; i < agent->tool_count; i++) {
         sz += 128;
+        /* Escaping can grow a control character to 6 bytes (\u00XX). */
         if (agent->tools[i].def.name)
-            sz += strlen(agent->tools[i].def.name) * 2;
+            sz += strlen(agent->tools[i].def.name) * 6;
         if (agent->tools[i].def.description)
-            sz += strlen(agent->tools[i].def.description) * 2;
+            sz += strlen(agent->tools[i].def.description) * 6;
         if (agent->tools[i].def.parameters_json)
             sz += strlen(agent->tools[i].def.parameters_json);
     }
@@ -98,6 +99,26 @@ static bool json_array_complete(const char *s) {
     n = strlen(s);
     return n >= 2 && s[0] == '[' && s[n - 1] == ']';
 }
+/* Append s as JSON string contents (without quotes). */
+static int append_json_escaped(char *buf, size_t bufsz, int off, const char *s) {
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\')
+            off = append_snprintf(buf, bufsz, off, "\\%c", c);
+        else if (c == '\n')
+            off = append_snprintf(buf, bufsz, off, "\\n");
+        else if (c == '\r')
+            off = append_snprintf(buf, bufsz, off, "\\r");
+        else if (c == '\t')
+            off = append_snprintf(buf, bufsz, off, "\\t");
+        else if (c < 0x20)
+            off = append_snprintf(buf, bufsz, off, "\\u%04x", c);
+        else
+            off = append_snprintf(buf, bufsz, off, "%c", c);
+    }
+    return off;
+}
+
 static const char *build_tools_json(nc_agent *agent) {
     size_t bufsz;
     char *buf;
@@ -112,11 +133,12 @@ static const char *build_tools_json(nc_agent *agent) {
 
     for (int i = 0; i < agent->tool_count; i++) {
         if (i > 0) off = append_snprintf(buf, bufsz, off, ",");
-        off = append_snprintf(buf, bufsz, off,
-            "{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":%s}}",
-            agent->tools[i].def.name,
-            agent->tools[i].def.description,
-            agent->tools[i].def.parameters_json);
+        off = append_snprintf(buf, bufsz, off, "{\"type\":\"function\",\"function\":{\"name\":\"");
+        off = append_json_escaped(buf, bufsz, off, agent->tools[i].def.name);
+        off = append_snprintf(buf, bufsz, off, "\",\"description\":\"");
+        off = append_json_escaped(buf, bufsz, off, agent->tools[i].def.description);
+        off = append_snprintf(buf, bufsz, off, "\",\"parameters\":%s}}",
+                              agent->tools[i].def.parameters_json);
     }
 
     off = append_snprintf(buf, bufsz, off, "]");
@@ -573,7 +595,35 @@ static void test_compaction_rounds(int calls_per_round, int rounds) {
     nc_agent_free(&agent);
 }
 
+static void test_tools_json_escaping(void) {
+    static nc_config cfg;
+    static nc_agent agent;
+    nc_tool tool = {
+        .def = {
+            .name = "ext",
+            .description = "Say \"hi\"\n\tthen C:\\path \x01",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+        },
+    };
+    memset(&cfg, 0, sizeof(cfg));
+    nc_agent_init(&agent, &cfg, NULL, &tool, 1, NULL);
+    const char *json = build_tools_json(&agent);
+    nc_arena a;
+    nc_arena_init(&a, 4096);
+    nc_json *arr = json ? nc_json_parse(&a, json, strlen(json)) : NULL;
+    nc_json *fn = arr && arr->type == NC_JSON_ARRAY && arr->array.count == 1
+        ? nc_json_get(&arr->array.items[0], "function") : NULL;
+    NC_ASSERT(fn != NULL, "tools JSON with special characters parses");
+    NC_ASSERT(fn && nc_str_eql(nc_json_str(nc_json_get(fn, "description"), ""),
+                               "Say \"hi\"\n\tthen C:\\path \x01"),
+              "tool description round-trips through tools JSON");
+    nc_arena_free(&a);
+    nc_agent_free(&agent);
+}
+
 void nc_test_agent(void) {
+    test_tools_json_escaping();
+
     test_compaction_rounds(1, 400);
     test_compaction_rounds(3, 200);
     test_compaction_rounds(7, 100);

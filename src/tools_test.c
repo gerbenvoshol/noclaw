@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <limits.h>
 
 static void mkdtemp_or_die(char *tmpl)
 {
@@ -22,6 +23,176 @@ static void setup_cfg(nc_config *cfg, const char *workspace, bool workspace_only
     memset(cfg, 0, sizeof(*cfg));
     nc_strlcpy(cfg->workspace_dir, workspace, sizeof(cfg->workspace_dir));
     cfg->workspace_only = workspace_only;
+}
+
+static void write_tool(const char *tools_dir, const char *dir, const char *manifest,
+                       const char *script, bool executable)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", tools_dir, dir);
+    mkdir(path, 0755);
+    if (manifest) {
+        snprintf(path, sizeof(path), "%s/%s/tool.json", tools_dir, dir);
+        nc_write_file(path, manifest, strlen(manifest));
+    }
+    if (script) {
+        snprintf(path, sizeof(path), "%s/%s/run", tools_dir, dir);
+        nc_write_file(path, script, strlen(script));
+        chmod(path, executable ? 0755 : 0644);
+    }
+}
+
+static nc_tool *find_loaded(nc_tool *tools, int n, const char *name)
+{
+    for (int i = 0; i < n; i++)
+        if (strcmp(tools[i].def.name, name) == 0)
+            return &tools[i];
+    return NULL;
+}
+
+static void test_external_tools(char *out, size_t out_cap)
+{
+    char ws[] = "/tmp/noclaw_extws_XXXXXX";
+    char td[] = "/tmp/noclaw_exttools_XXXXXX";
+    char real_ws[1024];
+    nc_config cfg;
+    nc_tool tools[NC_MAX_TOOLS];
+    int n;
+
+    mkdtemp_or_die(ws);
+    mkdtemp_or_die(td);
+    setup_cfg(&cfg, ws, true);
+    nc_strlcpy(cfg.tools_dir, td, sizeof(cfg.tools_dir));
+    NC_ASSERT(realpath(ws, real_ws) != NULL, "resolve ext test workspace");
+
+    write_tool(td, "echo", "{\"name\":\"echo_args\",\"description\":\"Echo \\\"args\\\"\\nback\","
+               "\"parameters\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"a\",\"b\"]}}}}",
+               "#!/bin/sh\ncat\necho\necho \"ws=$NOCLAW_WORKSPACE\"\necho \"pwd=$(pwd -P)\"\n"
+               "echo \"dir=$(basename \"$NOCLAW_TOOL_DIR\")\"\n", true);
+    write_tool(td, "fail", "{\"name\":\"fails\",\"description\":\"Always fails\"}",
+               "#!/bin/sh\necho broken >&2\nexit 3\n", true);
+    write_tool(td, "slow", "{\"name\":\"slow\",\"description\":\"Sleeps\",\"timeout_seconds\":1}",
+               "#!/bin/sh\nsleep 30\n", true);
+    write_tool(td, "big", "{\"name\":\"roundtrip\",\"description\":\"Copies stdin to stdout\"}",
+               "#!/bin/sh\nexec cat\n", true);
+    write_tool(td, "badjson", "{not json", "#!/bin/sh\n", true);
+    write_tool(td, "norun", "{\"name\":\"norun\",\"description\":\"x\"}", NULL, false);
+    write_tool(td, "noexec", "{\"name\":\"noexec\",\"description\":\"x\"}", "#!/bin/sh\n", false);
+    write_tool(td, "clash", "{\"name\":\"shell\",\"description\":\"x\"}", "#!/bin/sh\n", true);
+    write_tool(td, "badname", "{\"name\":\"bad name\",\"description\":\"x\"}", "#!/bin/sh\n", true);
+    write_tool(td, "nodesc", "{\"name\":\"nodesc\"}", "#!/bin/sh\n", true);
+    write_tool(td, "badtimeout", "{\"name\":\"badtimeout\",\"description\":\"x\",\"timeout_seconds\":0}",
+               "#!/bin/sh\n", true);
+
+    tools[0] = nc_tool_shell(&cfg);
+    n = nc_ext_tools_load(&cfg, tools, 1, NC_MAX_TOOLS, NULL);
+    NC_ASSERT(n == 5, "external tools: 4 valid tools loaded next to shell");
+    NC_ASSERT(strcmp(tools[0].def.name, "shell") == 0, "built-in shell keeps its slot");
+    NC_ASSERT(!find_loaded(tools, n, "norun") && !find_loaded(tools, n, "noexec") &&
+              !find_loaded(tools, n, "nodesc") && !find_loaded(tools, n, "badtimeout"),
+              "external tools: invalid manifests are skipped");
+
+    nc_tool *echo = find_loaded(tools, n, "echo_args");
+    NC_ASSERT(echo != NULL, "external tool registered under manifest name");
+    if (echo) {
+        NC_ASSERT(strstr(echo->def.description, "\"args\"\nback") != NULL,
+                  "external tool description is decoded");
+        NC_ASSERT(strstr(echo->def.parameters_json, "\"enum\":[\"a\",\"b\"]") != NULL,
+                  "external tool keeps its full parameter schema");
+        NC_ASSERT(echo->execute(echo, "{\"mode\":\"a\"}", out, out_cap),
+                  "external tool executes");
+        NC_ASSERT(strstr(out, "{\"mode\":\"a\"}") != NULL, "external tool receives args on stdin");
+        {
+            char expect[1200];
+            snprintf(expect, sizeof(expect), "ws=%s", real_ws);
+            NC_ASSERT(strstr(out, expect) != NULL, "external tool gets NOCLAW_WORKSPACE");
+            snprintf(expect, sizeof(expect), "pwd=%s", real_ws);
+            NC_ASSERT(strstr(out, expect) != NULL, "external tool runs in the workspace");
+        }
+        NC_ASSERT(strstr(out, "dir=echo") != NULL, "external tool gets NOCLAW_TOOL_DIR");
+    }
+
+    nc_tool *fails = find_loaded(tools, n, "fails");
+    NC_ASSERT(fails && !fails->execute(fails, "{}", out, out_cap), "failing external tool returns error");
+    NC_ASSERT(strstr(out, "broken") && strstr(out, "[exit code: 3]"),
+              "failing external tool reports stderr and exit code");
+
+    nc_tool *slow = find_loaded(tools, n, "slow");
+    {
+        time_t t0 = time(NULL);
+        NC_ASSERT(slow && !slow->execute(slow, "{}", out, out_cap), "slow external tool times out");
+        NC_ASSERT(strstr(out, "timed out after 1 seconds") != NULL,
+                  "external tool honours manifest timeout");
+        NC_ASSERT(time(NULL) - t0 < 5, "external tool timeout is prompt");
+    }
+
+    nc_tool *rt = find_loaded(tools, n, "roundtrip");
+    if (rt) {
+        size_t big = 200 * 1024;
+        char *args = (char *)malloc(big + 32);
+        memcpy(args, "{\"data\":\"", 9);
+        memset(args + 9, 'z', big);
+        memcpy(args + 9 + big, "\"}", 3);
+        NC_ASSERT(rt->execute(rt, args, out, out_cap), "external tool streams large stdin");
+        NC_ASSERT(strlen(out) == big + 11, "large stdin round-trips intact");
+        free(args);
+    }
+
+    {
+        /* doctor-style report lists every tool with its status */
+        char *rep = NULL;
+        size_t rep_len = 0;
+        FILE *f = open_memstream(&rep, &rep_len);
+        nc_tool more[NC_MAX_TOOLS];
+        more[0] = nc_tool_shell(&cfg);
+        int m = nc_ext_tools_load(&cfg, more, 1, NC_MAX_TOOLS, f);
+        fclose(f);
+        NC_ASSERT(rep && strstr(rep, "already used") && strstr(rep, "not executable") &&
+                  strstr(rep, "missing executable") && strstr(rep, "\"description\" is required"),
+                  "external tool report explains skipped tools");
+        for (int i = 1; i < m; i++) more[i].free(&more[i]);
+        free(rep);
+    }
+
+    {
+        nc_tool few[2];
+        few[0] = nc_tool_shell(&cfg);
+        NC_ASSERT(nc_ext_tools_load(&cfg, few, 1, 2, NULL) == 2,
+                  "external tools respect the tool limit");
+        few[1].free(&few[1]);
+    }
+
+    for (int i = 1; i < n; i++)
+        tools[i].free(&tools[i]);
+
+    {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", ws, td);
+        NC_ASSERT(system(cmd) == 0, "clean up external tool test dirs");
+    }
+}
+
+static void test_web_fetch_offline(char *out, size_t out_cap)
+{
+    nc_config cfg;
+    setup_cfg(&cfg, "/tmp", true);
+    nc_tool wf = nc_tool_web_fetch(&cfg);
+
+    NC_ASSERT(!wf.execute(&wf, "{}", out, out_cap) && strstr(out, "missing 'url'"),
+              "web_fetch requires url");
+    NC_ASSERT(!wf.execute(&wf, "{\"url\":\"file:///etc/passwd\"}", out, out_cap) &&
+              strstr(out, "only http"), "web_fetch rejects non-http schemes");
+    NC_ASSERT(!wf.execute(&wf, "{\"url\":\"http://127.0.0.1:9/\"}", out, out_cap) &&
+              strstr(out, "private or local"), "web_fetch blocks loopback by default");
+    NC_ASSERT(!wf.execute(&wf, "{\"url\":\"http://localhost:9/\"}", out, out_cap) &&
+              strstr(out, "private or local"), "web_fetch blocks names resolving to loopback");
+    NC_ASSERT(!wf.execute(&wf, "{\"url\":\"http://169.254.169.254/latest/meta-data/\"}", out, out_cap) &&
+              strstr(out, "private or local"), "web_fetch blocks cloud metadata address");
+
+    cfg.web_fetch_allow_private = true;
+    NC_ASSERT(!wf.execute(&wf, "{\"url\":\"http://127.0.0.1:9/\"}", out, out_cap) &&
+              strstr(out, "request to") && !strstr(out, "private"),
+              "web_fetch_allow_private lifts the block");
 }
 
 void nc_test_tools(void)
@@ -218,6 +389,9 @@ void nc_test_tools(void)
     NC_ASSERT(sh.execute(&sh, "{\"command\":\"echo err >&2\"}", out, sizeof(out)) &&
               strstr(out, "err") != NULL,
         "shell captures stderr");
+
+    test_external_tools(out, sizeof(out));
+    test_web_fetch_offline(out, sizeof(out));
 
     unlink("/tmp/escape.txt");
 }

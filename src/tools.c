@@ -21,6 +21,8 @@
 #endif
 
 #include <limits.h>
+#include <ctype.h>
+#include <strings.h>
 
 static bool path_is_safe_relative(const char *path);
 
@@ -267,72 +269,124 @@ static long long monotonic_ms(void)
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Run `/bin/sh -c shell_cmd` in its own process group with stdin from
- * /dev/null, capturing stdout+stderr into `out`. Output beyond out_cap is
- * drained and discarded so the child never blocks on a full pipe. If the
- * command is still running after timeout_s seconds, the whole process group
- * (pipelines, background jobs) is killed. */
-static bool run_shell_command(const char *shell_cmd, int timeout_s,
-                              char *out, size_t out_cap, int *status_out,
-                              bool *timed_out, bool *truncated)
+/* Run argv in its own process group, feeding stdin_data (or /dev/null) and
+ * capturing stdout+stderr into `out`. Output beyond out_cap is drained and
+ * discarded so the child never blocks on a full pipe; stdin is written
+ * non-blocking alongside so large inputs cannot deadlock against output.
+ * If the process is still running after timeout_seconds, the whole process
+ * group (pipelines, background jobs) is killed. */
+bool nc_run_process(const nc_proc_opts *o, char *out, size_t out_cap,
+                    nc_proc_result *r)
 {
-    int pipefd[2];
+    int out_pipe[2];
+    int in_pipe[2] = { -1, -1 };
     pid_t pid;
     size_t total = 0;
+    size_t in_off = 0;
+    int timeout_s = o->timeout_seconds > 0 ? o->timeout_seconds : 60;
     /* Leave room after captured output for truncation/exit/timeout notes. */
     size_t capture_cap = out_cap > 1024 ? out_cap - 256 : out_cap;
     long long deadline = monotonic_ms() + (long long)timeout_s * 1000;
+    struct sigaction ign, old_pipe;
 
-    *timed_out = false;
-    *truncated = false;
+    memset(r, 0, sizeof(*r));
+    if (out_cap == 0)
+        return false;
     out[0] = '\0';
 
-    if (pipe(pipefd) != 0) {
+    if (pipe(out_pipe) != 0) {
         snprintf(out, out_cap, "error: failed to create pipe: %s", strerror(errno));
+        return false;
+    }
+    if (o->stdin_data && pipe(in_pipe) != 0) {
+        snprintf(out, out_cap, "error: failed to create pipe: %s", strerror(errno));
+        close(out_pipe[0]);
+        close(out_pipe[1]);
         return false;
     }
 
     pid = fork();
     if (pid < 0) {
         int saved = errno;
-        close(pipefd[0]);
-        close(pipefd[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        if (in_pipe[0] >= 0) { close(in_pipe[0]); close(in_pipe[1]); }
         snprintf(out, out_cap, "error: failed to execute command: %s", strerror(saved));
         return false;
     }
 
     if (pid == 0) {
-        int devnull = open("/dev/null", O_RDONLY);
         setpgid(0, 0);
-        if (devnull >= 0) {
-            dup2(devnull, STDIN_FILENO);
-            close(devnull);
+        if (in_pipe[0] >= 0) {
+            dup2(in_pipe[0], STDIN_FILENO);
+            close(in_pipe[0]);
+            close(in_pipe[1]);
+        } else {
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
         }
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        execl("/bin/sh", "sh", "-c", shell_cmd, (char *)NULL);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(out_pipe[1], STDERR_FILENO);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        if (o->cwd && chdir(o->cwd) != 0) {
+            static const char msg[] = "error: cannot enter working directory\n";
+            ssize_t ignored = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+            (void)ignored;
+            _exit(126);
+        }
+        for (const char *const *e = o->env; e && *e; e++) {
+            const char *eq = strchr(*e, '=');
+            char key[128];
+            if (!eq || (size_t)(eq - *e) >= sizeof(key))
+                continue;
+            memcpy(key, *e, (size_t)(eq - *e));
+            key[eq - *e] = '\0';
+            setenv(key, eq + 1, 1);
+        }
+        execv(o->argv[0], (char *const *)o->argv);
         _exit(127);
     }
 
     /* Also set in the parent so kill(-pid) works even if the child has not
      * run setpgid yet. */
     setpgid(pid, pid);
-    close(pipefd[1]);
+    close(out_pipe[1]);
+
+    /* A child that exits without reading its stdin must not SIGPIPE us. */
+    memset(&ign, 0, sizeof(ign));
+    ign.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ign, &old_pipe);
+
+    if (in_pipe[0] >= 0) {
+        close(in_pipe[0]);
+        fcntl(in_pipe[1], F_SETFL, fcntl(in_pipe[1], F_GETFL) | O_NONBLOCK);
+        if (o->stdin_len == 0) {
+            close(in_pipe[1]);
+            in_pipe[1] = -1;
+        }
+    }
 
     for (;;) {
         long long remaining = deadline - monotonic_ms();
-        struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
+        struct pollfd pfd[2];
+        int nfds = 1;
         char buf[4096];
         ssize_t n;
         int pr;
 
         if (remaining <= 0) {
-            *timed_out = true;
+            r->timed_out = true;
             break;
         }
-        pr = poll(&pfd, 1, remaining > INT_MAX ? INT_MAX : (int)remaining);
+        pfd[0] = (struct pollfd){ .fd = out_pipe[0], .events = POLLIN };
+        if (in_pipe[1] >= 0)
+            pfd[nfds++] = (struct pollfd){ .fd = in_pipe[1], .events = POLLOUT };
+
+        pr = poll(pfd, (nfds_t)nfds, remaining > INT_MAX ? INT_MAX : (int)remaining);
         if (pr < 0) {
             if (errno == EINTR)
                 continue;
@@ -341,7 +395,20 @@ static bool run_shell_command(const char *shell_cmd, int timeout_s,
         if (pr == 0)
             continue; /* deadline re-checked at top of loop */
 
-        n = read(pipefd[0], buf, sizeof(buf));
+        if (nfds == 2 && pfd[1].revents) {
+            n = write(in_pipe[1], o->stdin_data + in_off, o->stdin_len - in_off);
+            if (n > 0)
+                in_off += (size_t)n;
+            if ((n < 0 && errno != EAGAIN && errno != EINTR) ||
+                in_off >= o->stdin_len || (pfd[1].revents & (POLLERR | POLLHUP))) {
+                close(in_pipe[1]);
+                in_pipe[1] = -1;
+            }
+        }
+
+        if (!pfd[0].revents)
+            continue;
+        n = read(out_pipe[0], buf, sizeof(buf));
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -357,35 +424,37 @@ static bool run_shell_command(const char *shell_cmd, int timeout_s,
             memcpy(out + total, buf, cp);
             total += cp;
             if (cp < (size_t)n)
-                *truncated = true;
+                r->truncated = true;
         } else {
-            *truncated = true;
+            r->truncated = true;
         }
     }
-    close(pipefd[0]);
+    close(out_pipe[0]);
+    if (in_pipe[1] >= 0)
+        close(in_pipe[1]);
+    sigaction(SIGPIPE, &old_pipe, NULL);
     out[total] = '\0';
 
-    if (*timed_out)
+    if (r->timed_out)
         kill(-pid, SIGKILL);
 
-    /* The shell may outlive its stdout (e.g. `exec >&-; sleep 100`), so keep
-     * honouring the deadline while waiting for it to exit. */
+    /* The process may outlive its stdout (e.g. `exec >&-; sleep 100`), so
+     * keep honouring the deadline while waiting for it to exit. */
     for (;;) {
-        pid_t w = waitpid(pid, status_out, *timed_out ? 0 : WNOHANG);
+        pid_t w = waitpid(pid, &r->status, r->timed_out ? 0 : WNOHANG);
         if (w == pid)
             break;
         if (w < 0) {
             if (errno == EINTR)
                 continue;
-            snprintf(out, out_cap, "error: failed to wait for shell process: %s", strerror(errno));
+            snprintf(out, out_cap, "error: failed to wait for process: %s", strerror(errno));
             kill(-pid, SIGKILL);
             return false;
         }
-        if (*timed_out) {
+        if (r->timed_out)
             continue;
-        }
         if (monotonic_ms() >= deadline) {
-            *timed_out = true;
+            r->timed_out = true;
             kill(-pid, SIGKILL);
             continue;
         }
@@ -400,6 +469,40 @@ static bool run_shell_command(const char *shell_cmd, int timeout_s,
     return true;
 }
 
+/* Append the standard notes (truncation, timeout, signal, exit code) for a
+ * finished process. Returns true only for a clean exit with status 0. */
+bool nc_proc_annotate(const nc_proc_result *r, int timeout_seconds,
+                      char *out, size_t out_cap)
+{
+    char suffix[96];
+
+    if (r->truncated)
+        append_suffix(out, out_cap, "\n[output truncated]");
+
+    if (r->timed_out) {
+        snprintf(suffix, sizeof(suffix),
+                 "\n[timed out after %d seconds; process killed]", timeout_seconds);
+        append_suffix(out, out_cap, suffix);
+        return false;
+    }
+    if (!WIFEXITED(r->status)) {
+        if (WIFSIGNALED(r->status)) {
+            snprintf(suffix, sizeof(suffix), "\n[terminated by signal: %d]",
+                     WTERMSIG(r->status));
+            append_suffix(out, out_cap, suffix);
+        } else {
+            append_suffix(out, out_cap, "\n[process terminated abnormally]");
+        }
+        return false;
+    }
+    if (WEXITSTATUS(r->status) != 0) {
+        snprintf(suffix, sizeof(suffix), "\n[exit code: %d]", WEXITSTATUS(r->status));
+        append_suffix(out, out_cap, suffix);
+        return false;
+    }
+    return true;
+}
+
 static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
     char *command = NULL;
@@ -407,7 +510,6 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
     char block_reason[128];
     size_t full_len = 0;
     nc_extract_status est;
-    int status = 0;
     bool ok = false;
 
     if (out_cap == 0)
@@ -499,45 +601,16 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
 
     {
         int timeout_s = cfg->shell_timeout_seconds > 0 ? cfg->shell_timeout_seconds : 60;
-        bool timed_out, truncated;
+        const char *argv[] = { "/bin/sh", "-c", shell_cmd, NULL };
+        nc_proc_opts po = { .argv = argv, .timeout_seconds = timeout_s };
+        nc_proc_result pr;
 
-        if (!run_shell_command(shell_cmd, timeout_s, out, out_cap,
-                               &status, &timed_out, &truncated))
+        if (!nc_run_process(&po, out, out_cap, &pr))
             goto cleanup;
-
-        if (truncated)
-            append_suffix(out, out_cap, "\n[output truncated]");
-
-        if (timed_out) {
-            char suffix[96];
-            snprintf(suffix, sizeof(suffix),
-                     "\n[timed out after %d seconds; process killed]", timeout_s);
-            append_suffix(out, out_cap, suffix);
+        if (pr.timed_out)
             tool_debug("shell", "command timed out after %d seconds", timeout_s);
+        if (!nc_proc_annotate(&pr, timeout_s, out, out_cap))
             goto cleanup;
-        }
-    }
-
-    if (!WIFEXITED(status)) {
-        if (WIFSIGNALED(status)) {
-            char suffix[64];
-            int n = snprintf(suffix, sizeof(suffix),
-                             "\n[terminated by signal: %d]",
-                             WTERMSIG(status));
-            if (n >= 0)
-                append_suffix(out, out_cap, suffix);
-        } else {
-            append_suffix(out, out_cap, "\n[process terminated abnormally]");
-        }
-        goto cleanup;
-    }
-
-    if (WEXITSTATUS(status) != 0) {
-        char suffix[64];
-        int n = snprintf(suffix, sizeof(suffix), "\n[exit code: %d]", WEXITSTATUS(status));
-        if (n >= 0)
-            append_suffix(out, out_cap, suffix);
-        goto cleanup;
     }
 
     ok = true;
@@ -1672,6 +1745,571 @@ nc_tool nc_tool_apply_patch(const nc_config *cfg) {
     };
 }
 
+/* ── Web fetch tool ───────────────────────────────────────────── */
+
+#define NC_WEB_FETCH_MAX_BODY      (2 * 1024 * 1024)
+#define NC_WEB_FETCH_DEFAULT_CHARS 20000
+#define NC_WEB_FETCH_MAX_REDIRECTS 5
+
+/* Bounded text writer with HTML-style whitespace collapsing. */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+    int    pending_nl;    /* newlines owed before the next visible char */
+    bool   pending_space;
+    bool   pre;           /* inside <pre>: keep whitespace */
+} text_out;
+
+static void to_raw(text_out *t, const char *s, size_t n) {
+    if (t->len + n >= t->cap)
+        return;
+    memcpy(t->buf + t->len, s, n);
+    t->len += n;
+    t->buf[t->len] = '\0';
+}
+
+static void to_flush(text_out *t) {
+    if (t->len > 0 && t->pending_nl > 0) {
+        to_raw(t, "\n\n", (size_t)(t->pending_nl > 2 ? 2 : t->pending_nl));
+    } else if (t->len > 0 && t->pending_space && t->buf[t->len - 1] != '\n') {
+        to_raw(t, " ", 1);
+    }
+    t->pending_nl = 0;
+    t->pending_space = false;
+}
+
+static void to_text(text_out *t, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+            if (t->pre && c == '\n') {
+                t->pending_space = false;
+                to_raw(t, "\n", 1);
+            } else if (t->pre && c != '\r') {
+                to_raw(t, " ", 1);
+            } else {
+                t->pending_space = true;
+            }
+            continue;
+        }
+        to_flush(t);
+        to_raw(t, &c, 1);
+    }
+}
+
+static void to_break(text_out *t, int lines) {
+    if (t->pending_nl < lines)
+        t->pending_nl = lines;
+}
+
+static size_t utf8_encode(unsigned long cp, char *out) {
+    if (cp == 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+        cp = 0xfffd;
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xc0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xe0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[2] = (char)(0x80 | (cp & 0x3f));
+        return 3;
+    }
+    out[0] = (char)(0xf0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[3] = (char)(0x80 | (cp & 0x3f));
+    return 4;
+}
+
+/* Decode an entity starting at s[0] == '&'. Writes UTF-8 to out and returns
+ * the number of input bytes consumed, or 0 if it is not an entity. */
+static size_t decode_entity(const char *s, size_t len, char *out, size_t *out_len) {
+    static const struct { const char *name; unsigned long cp; } named[] = {
+        {"amp", '&'}, {"lt", '<'}, {"gt", '>'}, {"quot", '"'}, {"apos", '\''},
+        {"nbsp", ' '}, {"mdash", 0x2014}, {"ndash", 0x2013}, {"hellip", 0x2026},
+        {"copy", 0xa9}, {"reg", 0xae}, {"lsquo", 0x2018}, {"rsquo", 0x2019},
+        {"ldquo", 0x201c}, {"rdquo", 0x201d}, {"middot", 0xb7}, {"bull", 0x2022},
+    };
+    size_t semi = 1;
+    while (semi < len && semi < 12 && s[semi] != ';')
+        semi++;
+    if (semi >= len || s[semi] != ';' || semi < 2)
+        return 0;
+
+    if (s[1] == '#') {
+        char *end;
+        unsigned long cp = (s[2] == 'x' || s[2] == 'X')
+            ? strtoul(s + 3, &end, 16) : strtoul(s + 2, &end, 10);
+        if (end != s + semi)
+            return 0;
+        *out_len = utf8_encode(cp, out);
+        return semi + 1;
+    }
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        size_t nl = strlen(named[i].name);
+        if (nl == semi - 1 && strncmp(s + 1, named[i].name, nl) == 0) {
+            *out_len = utf8_encode(named[i].cp, out);
+            return semi + 1;
+        }
+    }
+    return 0;
+}
+
+/* Decode entities in s[0..n) and feed the result to the writer. */
+static void to_html_text(text_out *t, const char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        if (s[i] == '&') {
+            char enc[4];
+            size_t enc_len = 0;
+            size_t used = decode_entity(s + i, n - i, enc, &enc_len);
+            if (used) {
+                if (enc_len == 1 && enc[0] == ' ')
+                    to_text(t, " ", 1);
+                else {
+                    to_flush(t);
+                    to_raw(t, enc, enc_len);
+                }
+                i += used;
+                continue;
+            }
+        }
+        size_t j = i + 1;
+        while (j < n && s[j] != '&')
+            j++;
+        to_text(t, s + i, j - i);
+        i = j;
+    }
+}
+
+static const char *find_ci(const char *s, const char *end, const char *needle) {
+    size_t nl = strlen(needle);
+    for (const char *p = s; p + nl <= end; p++) {
+        if (strncasecmp(p, needle, nl) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+/* Find the '>' that closes a tag, skipping quoted attribute values. */
+static const char *tag_end(const char *p, const char *end) {
+    char quote = 0;
+    for (; p < end; p++) {
+        if (quote) {
+            if (*p == quote) quote = 0;
+        } else if (*p == '"' || *p == '\'') {
+            quote = *p;
+        } else if (*p == '>') {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Copy an attribute value (e.g. href) from a tag's text into out. */
+static void tag_attr(const char *tag, const char *end, const char *attr,
+                     char *out, size_t out_cap) {
+    size_t al = strlen(attr);
+    out[0] = '\0';
+    for (const char *p = tag; p + al < end; p++) {
+        if (strncasecmp(p, attr, al) != 0 || (p > tag && !isspace((unsigned char)p[-1])))
+            continue;
+        const char *v = p + al;
+        while (v < end && isspace((unsigned char)*v)) v++;
+        if (v >= end || *v != '=') continue;
+        v++;
+        while (v < end && isspace((unsigned char)*v)) v++;
+        char quote = (v < end && (*v == '"' || *v == '\'')) ? *v++ : 0;
+        size_t n = 0;
+        while (v + n < end && (quote ? v[n] != quote : !isspace((unsigned char)v[n])))
+            n++;
+        if (n >= out_cap) n = out_cap - 1;
+        memcpy(out, v, n);
+        out[n] = '\0';
+        return;
+    }
+}
+
+static bool tag_in(const char *name, const char *const *list) {
+    for (; *list; list++) {
+        if (strcmp(name, *list) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Convert HTML to readable plain text: drops scripts/styles/comments, turns
+ * block elements into line breaks, headings into "# ", list items into
+ * "- ", appends link targets as " (url)", decodes entities and collapses
+ * whitespace. Returns a malloc'd string, or NULL on allocation failure. */
+static char *html_to_text(const char *html, size_t len) {
+    static const char *const skip_tags[] = {
+        "script", "style", "noscript", "template", "svg", "iframe", "object", NULL
+    };
+    static const char *const para_tags[] = {
+        "p", "table", "blockquote", "pre", "section", "article", "header",
+        "footer", "main", "nav", "aside", "form", "figure", "details", "ul", "ol", "dl", NULL
+    };
+    static const char *const line_tags[] = {
+        "br", "div", "tr", "hr", "dt", "dd", "figcaption", "summary", "li",
+        "h1", "h2", "h3", "h4", "h5", "h6", NULL
+    };
+    const char *p = html;
+    const char *end = html + len;
+    char title[512] = "";
+    char href[512] = "";
+    size_t link_text_start = 0;
+    text_out t = { 0 };
+
+    t.cap = len + 1024;
+    t.buf = (char *)malloc(t.cap);
+    if (!t.buf)
+        return NULL;
+    t.buf[0] = '\0';
+
+    while (p < end) {
+        if (*p != '<') {
+            const char *lt = memchr(p, '<', (size_t)(end - p));
+            const char *stop = lt ? lt : end;
+            to_html_text(&t, p, (size_t)(stop - p));
+            p = stop;
+            continue;
+        }
+
+        if (end - p >= 4 && strncmp(p, "<!--", 4) == 0) {
+            const char *c = find_ci(p + 4, end, "-->");
+            p = c ? c + 3 : end;
+            continue;
+        }
+        if (p + 1 < end && (p[1] == '!' || p[1] == '?')) {
+            const char *gt = memchr(p, '>', (size_t)(end - p));
+            p = gt ? gt + 1 : end;
+            continue;
+        }
+
+        bool closing = (p + 1 < end && p[1] == '/');
+        const char *n = p + (closing ? 2 : 1);
+        char name[16];
+        size_t nl = 0;
+        while (n + nl < end && isalnum((unsigned char)n[nl]) && nl < sizeof(name) - 1) {
+            name[nl] = (char)tolower((unsigned char)n[nl]);
+            nl++;
+        }
+        name[nl] = '\0';
+        if (nl == 0) {
+            /* A bare '<' in text */
+            to_text(&t, "<", 1);
+            p++;
+            continue;
+        }
+        const char *gt = tag_end(n + nl, end);
+        if (!gt)
+            break;
+
+        if (!closing && (tag_in(name, skip_tags) || strcmp(name, "title") == 0)) {
+            char close_tag[24];
+            snprintf(close_tag, sizeof(close_tag), "</%s", name);
+            const char *c = find_ci(gt + 1, end, close_tag);
+            if (strcmp(name, "title") == 0 && c && !title[0]) {
+                text_out tt = { .buf = title, .cap = sizeof(title) };
+                to_html_text(&tt, gt + 1, (size_t)(c - (gt + 1)));
+            }
+            if (!c) {
+                p = end;
+                continue;
+            }
+            const char *cgt = memchr(c, '>', (size_t)(end - c));
+            p = cgt ? cgt + 1 : end;
+            continue;
+        }
+
+        if (tag_in(name, para_tags))
+            to_break(&t, 2);
+        else if (tag_in(name, line_tags))
+            to_break(&t, 1);
+
+        if (!closing && name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) {
+            to_break(&t, 2);
+            to_flush(&t);
+            for (int i = 0; i < name[1] - '0'; i++)
+                to_raw(&t, "#", 1);
+            to_raw(&t, " ", 1);
+        } else if (closing && name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) {
+            to_break(&t, 2);
+        } else if (!closing && strcmp(name, "li") == 0) {
+            to_flush(&t);
+            to_raw(&t, "- ", 2);
+        } else if (strcmp(name, "pre") == 0) {
+            t.pre = !closing;
+        } else if (strcmp(name, "td") == 0 || strcmp(name, "th") == 0) {
+            t.pending_space = true;
+        } else if (strcmp(name, "a") == 0) {
+            if (!closing) {
+                char raw_href[512];
+                text_out ht = { .buf = href, .cap = sizeof(href) };
+                tag_attr(n + nl, gt, "href", raw_href, sizeof(raw_href));
+                href[0] = '\0';
+                to_html_text(&ht, raw_href, strlen(raw_href)); /* decode &amp; etc. */
+                link_text_start = t.len;
+            } else if (href[0] && href[0] != '#' &&
+                       strncasecmp(href, "javascript:", 11) != 0 &&
+                       strncasecmp(href, "mailto:", 7) != 0) {
+                /* Skip when the link text already is the URL. */
+                size_t text_len = t.len - link_text_start;
+                if (!(text_len == strlen(href) &&
+                      memcmp(t.buf + link_text_start, href, text_len) == 0)) {
+                    to_raw(&t, " (", 2);
+                    to_raw(&t, href, strlen(href));
+                    to_raw(&t, ")", 1);
+                }
+                href[0] = '\0';
+            }
+        } else if (strcmp(name, "img") == 0 && !closing) {
+            char alt[256];
+            tag_attr(n + nl, gt, "alt", alt, sizeof(alt));
+            if (alt[0]) {
+                to_text(&t, "[image: ", 8);
+                to_html_text(&t, alt, strlen(alt));
+                to_text(&t, "]", 1);
+            }
+        }
+
+        p = gt + 1;
+    }
+
+    if (title[0]) {
+        size_t tl = strlen(title);
+        char *withtitle = (char *)malloc(t.len + tl + 16);
+        if (withtitle) {
+            int w = snprintf(withtitle, t.len + tl + 16, "Title: %s\n\n%s", title, t.buf);
+            (void)w;
+            free(t.buf);
+            return withtitle;
+        }
+    }
+    return t.buf;
+}
+
+/* Resolve a redirect Location against the URL that produced it. */
+static bool resolve_url(const char *base, const char *loc, char *out, size_t out_cap) {
+    const char *scheme_end = strstr(base, "://");
+    if (!scheme_end)
+        return false;
+
+    if (strncasecmp(loc, "http://", 7) == 0 || strncasecmp(loc, "https://", 8) == 0)
+        return nc_strlcpy(out, loc, out_cap) < out_cap;
+
+    if (loc[0] == '/' && loc[1] == '/')
+        return snprintf(out, out_cap, "%.*s:%s",
+                        (int)(scheme_end - base), base, loc) < (int)out_cap;
+
+    const char *host = scheme_end + 3;
+    const char *path = strchr(host, '/');
+    size_t origin_len = path ? (size_t)(path - base) : strlen(base);
+
+    if (loc[0] == '/')
+        return snprintf(out, out_cap, "%.*s%s", (int)origin_len, base, loc) < (int)out_cap;
+
+    /* Relative path: replace everything after the last '/' of the base path
+     * (ignoring any query string). */
+    size_t dir_len = origin_len;
+    if (path) {
+        const char *q = strpbrk(path, "?#");
+        const char *path_end = q ? q : path + strlen(path);
+        for (const char *s = path; s < path_end; s++) {
+            if (*s == '/')
+                dir_len = (size_t)(s - base) + 1;
+        }
+    }
+    return snprintf(out, out_cap, "%.*s%s%s", (int)dir_len, base,
+                    path ? "" : "/", loc) < (int)out_cap;
+}
+
+static bool content_type_is(const char *ct, const char *what) {
+    char lower[128];
+    size_t i;
+    for (i = 0; ct[i] && i < sizeof(lower) - 1; i++)
+        lower[i] = (char)tolower((unsigned char)ct[i]);
+    lower[i] = '\0';
+    return strstr(lower, what) != NULL;
+}
+
+static bool looks_like_html(const char *body, size_t len) {
+    size_t n = len < 1024 ? len : 1024;
+    return find_ci(body, body + n, "<!doctype html") || find_ci(body, body + n, "<html");
+}
+
+static bool looks_binary(const char *body, size_t len) {
+    size_t n = len < 4096 ? len : 4096;
+    return memchr(body, '\0', n) != NULL;
+}
+
+static bool web_fetch_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
+    const nc_config *cfg = (const nc_config *)self->ctx;
+    char url[2048];
+    char next[2048];
+    long max_chars = NC_WEB_FETCH_DEFAULT_CHARS;
+    nc_http_response resp;
+    nc_arena a;
+    bool ok = false;
+    char *text = NULL;
+
+    if (out_cap < 256)
+        return false;
+    out[0] = '\0';
+    memset(&resp, 0, sizeof(resp));
+
+    nc_arena_init(&a, strlen(args_json) * 2 + 256);
+    nc_json *root = nc_json_parse(&a, args_json, strlen(args_json));
+    nc_json *uv = root ? nc_json_get(root, "url") : NULL;
+    if (!uv || uv->type != NC_JSON_STRING || uv->string.len == 0) {
+        nc_strlcpy(out, root ? "error: missing 'url' argument" : "error: invalid JSON arguments",
+                   out_cap);
+        nc_arena_free(&a);
+        return false;
+    }
+    if (uv->string.len >= sizeof(url)) {
+        nc_strlcpy(out, "error: 'url' argument too long", out_cap);
+        nc_arena_free(&a);
+        return false;
+    }
+    memcpy(url, uv->string.ptr, uv->string.len);
+    url[uv->string.len] = '\0';
+    max_chars = (long)nc_json_num(nc_json_get(root, "max_chars"), (double)max_chars);
+    nc_arena_free(&a);
+
+    if (max_chars < 100)
+        max_chars = 100;
+    if ((size_t)max_chars > out_cap - 512)
+        max_chars = (long)(out_cap - 512);
+
+    const char *headers[] = {
+        "User-Agent: noclaw/" NC_VERSION " (+https://github.com/noclaw/noclaw)",
+        "Accept: text/html,text/plain,application/json,application/xml;q=0.9,*/*;q=0.5",
+        "Accept-Encoding: identity",
+    };
+    nc_http_get_opts opts = {
+        .max_body = NC_WEB_FETCH_MAX_BODY,
+        .block_private = !cfg->web_fetch_allow_private,
+    };
+
+    for (int hop = 0; ; hop++) {
+        char *frag = strchr(url, '#');
+        if (frag)
+            *frag = '\0';
+        if (strncasecmp(url, "http://", 7) != 0 && strncasecmp(url, "https://", 8) != 0) {
+            snprintf(out, out_cap, "error: only http:// and https:// URLs are supported: %s", url);
+            return false;
+        }
+
+        tool_debug("web_fetch", "GET %s", url);
+        if (!nc_http_get_ex(url, headers, 3, &opts, &resp)) {
+            if (resp.blocked)
+                snprintf(out, out_cap,
+                         "error: refusing to fetch %s: it resolves to a private or local address "
+                         "(set autonomy.web_fetch_allow_private to allow)", url);
+            else
+                snprintf(out, out_cap, "error: request to %s failed (DNS, connection, TLS or timeout)", url);
+            nc_http_response_free(&resp);
+            return false;
+        }
+
+        bool redirect = (resp.status == 301 || resp.status == 302 || resp.status == 303 ||
+                         resp.status == 307 || resp.status == 308) && resp.location[0];
+        if (!redirect)
+            break;
+        if (hop >= NC_WEB_FETCH_MAX_REDIRECTS) {
+            snprintf(out, out_cap, "error: too many redirects (last: %s)", url);
+            nc_http_response_free(&resp);
+            return false;
+        }
+        if (!resolve_url(url, resp.location, next, sizeof(next))) {
+            snprintf(out, out_cap, "error: invalid redirect location: %s", resp.location);
+            nc_http_response_free(&resp);
+            return false;
+        }
+        nc_http_response_free(&resp);
+        nc_strlcpy(url, next, sizeof(url));
+    }
+
+    const char *body = resp.body ? resp.body : "";
+    size_t body_len = resp.body ? resp.body_len : 0;
+    bool is_html = content_type_is(resp.content_type, "html") ||
+                   (!resp.content_type[0] && looks_like_html(body, body_len));
+    bool is_text = is_html ||
+                   content_type_is(resp.content_type, "text/") ||
+                   content_type_is(resp.content_type, "json") ||
+                   content_type_is(resp.content_type, "xml") ||
+                   content_type_is(resp.content_type, "javascript") ||
+                   (!resp.content_type[0] && !looks_binary(body, body_len));
+
+    int hdr = snprintf(out, out_cap, "URL: %s\nStatus: %d\nContent-Type: %s\n\n",
+                       url, resp.status, resp.content_type[0] ? resp.content_type : "unknown");
+    if (hdr < 0 || (size_t)hdr >= out_cap)
+        hdr = 0;
+
+    if (!is_text) {
+        snprintf(out + hdr, out_cap - (size_t)hdr,
+                 "error: unsupported content type (binary, %zu bytes%s); use shell tools to download it",
+                 body_len, resp.truncated ? "+" : "");
+        goto done;
+    }
+
+    if (is_html) {
+        text = html_to_text(body, body_len);
+        if (!text) {
+            nc_strlcpy(out, "error: out of memory", out_cap);
+            goto done;
+        }
+        body = text;
+        body_len = strlen(text);
+    }
+
+    {
+        size_t room = out_cap - (size_t)hdr - 128;
+        size_t limit = (size_t)max_chars < room ? (size_t)max_chars : room;
+        size_t n = nc_utf8_safe_prefix(body, body_len, limit);
+        if (n == 0 && body_len > 0 && limit > 0) {
+            /* Not valid UTF-8 at the start: copy raw bytes; the provider
+             * replaces malformed sequences when serializing. */
+            n = body_len < limit ? body_len : limit;
+        }
+        memcpy(out + hdr, body, n);
+        out[hdr + n] = '\0';
+        if (n < body_len || resp.truncated) {
+            char note[96];
+            snprintf(note, sizeof(note),
+                     "\n[content truncated: showing %zu of %zu%s characters; raise max_chars for more]",
+                     n, body_len, resp.truncated ? "+" : "");
+            append_suffix(out, out_cap, note);
+        }
+    }
+    ok = resp.status >= 200 && resp.status < 400;
+
+done:
+    free(text);
+    nc_http_response_free(&resp);
+    return ok;
+}
+
+nc_tool nc_tool_web_fetch(const nc_config *cfg) {
+    return (nc_tool){
+        .def = {
+            .name = "web_fetch",
+            .description = "Fetch a web page or text resource over HTTP(S) and return it as readable text. HTML is converted to plain text with link targets in parentheses.",
+            .parameters_json =
+                "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"http:// or https:// URL to fetch\"},\"max_chars\":{\"type\":\"integer\",\"description\":\"Maximum characters of content to return (default 20000)\"}},\"required\":[\"url\"]}",
+        },
+        .ctx = (void *)cfg,
+        .execute = web_fetch_execute,
+        .free = NULL,
+    };
+}
+
 /* ── Memory store tool ────────────────────────────────────────── */
 
 static bool memory_store_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
@@ -1778,6 +2416,60 @@ nc_tool nc_tool_memory_recall(void *mem_ctx) {
 }
 
 #ifdef NC_TEST
+static bool html_case(const char *html, const char *expect) {
+    char *t = html_to_text(html, strlen(html));
+    bool ok = t && strcmp(t, expect) == 0;
+    if (!ok)
+        fprintf(stderr, "  html_to_text(%s)\n    got:    [%s]\n    expect: [%s]\n",
+                html, t ? t : "(null)", expect);
+    free(t);
+    return ok;
+}
+
+static bool resolve_case(const char *base, const char *loc, const char *expect) {
+    char out[512];
+    return resolve_url(base, loc, out, sizeof(out)) && strcmp(out, expect) == 0;
+}
+
+void nc_test_web_fetch(void) {
+    NC_ASSERT(html_case("<p>Hello <b>world</b></p><p>Second</p>", "Hello world\n\nSecond"),
+              "html: paragraphs and inline tags");
+    NC_ASSERT(html_case("<html><head><title>T &amp; U</title><style>p{x:1}</style>"
+                        "<script>var a='<p>';</script></head><body>Body</body></html>",
+                        "Title: T & U\n\nBody"),
+              "html: title extracted, script/style dropped");
+    NC_ASSERT(html_case("<h2>Intro</h2><ul><li>one</li><li>two</li></ul>",
+                        "## Intro\n\n- one\n- two"),
+              "html: headings and list items");
+    NC_ASSERT(html_case("See <a href=\"/docs?a=1&amp;b=2\">the docs</a>.",
+                        "See the docs (/docs?a=1&b=2)."),
+              "html: link targets appended");
+    NC_ASSERT(html_case("<a href=\"https://x.org\">https://x.org</a> <a href=\"#top\">top</a>",
+                        "https://x.org top"),
+              "html: redundant and fragment links not repeated");
+    NC_ASSERT(html_case("a &lt;b&gt; &#233; &#x1F44B; &nbsp;c &bogus; &", "a <b> \xc3\xa9 \xf0\x9f\x91\x8b c &bogus; &"),
+              "html: entities decoded");
+    NC_ASSERT(html_case("<!-- hidden --><pre>a  b\n  c</pre>x", "a  b\n  c\n\nx"),
+              "html: comments dropped, pre keeps whitespace");
+    NC_ASSERT(html_case("1 < 2 and <img src=x alt=\"a cat\"> ok", "1 < 2 and [image: a cat] ok"),
+              "html: bare '<' and image alt text");
+    NC_ASSERT(html_case("<div title=\"a>b\">x</div>", "x"),
+              "html: '>' inside quoted attribute");
+
+    NC_ASSERT(resolve_case("https://a.com/x/y?q=1", "https://b.com/z", "https://b.com/z"),
+              "redirect: absolute URL");
+    NC_ASSERT(resolve_case("https://a.com/x/y", "//c.com/p", "https://c.com/p"),
+              "redirect: protocol-relative");
+    NC_ASSERT(resolve_case("https://a.com/x/y?q=1", "/root", "https://a.com/root"),
+              "redirect: absolute path");
+    NC_ASSERT(resolve_case("https://a.com/x/y?q=/no", "z", "https://a.com/x/z"),
+              "redirect: relative path ignores query");
+    NC_ASSERT(resolve_case("https://a.com", "z", "https://a.com/z"),
+              "redirect: relative path from bare host");
+    NC_ASSERT(resolve_case("http://a.com:8080/docs", "/docs/", "http://a.com:8080/docs/"),
+              "redirect: keeps port");
+}
+
 void nc_test_tools_utf8(void) {
     const char *json = "{\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x91\x8b\"}";
     char full[16];

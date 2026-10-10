@@ -27,6 +27,7 @@
 #define NC_CONFIG_DIR    ".noclaw"
 #define NC_CONFIG_FILE   "config.json"
 #define NC_WORKSPACE_DIR "workspace"
+#define NC_TOOLS_DIR     "tools"
 
 #define NC_TOOL_ARGS_MAX     (256 * 1024)
 #define NC_TOOL_RESULT_MAX   (256 * 1024)
@@ -147,6 +148,7 @@ typedef struct nc_config {
     char config_dir[512];
     char config_path[1024];
     char workspace_dir[1024];
+    char tools_dir[1024];       /* external tools, default ~/.noclaw/tools */
     char instructions_file[1024];
 
     /* Top-level */
@@ -176,6 +178,7 @@ typedef struct nc_config {
     int  max_actions_per_hour;
     int  max_iterations;
     int  shell_timeout_seconds;
+    bool web_fetch_allow_private;
 
     /* Heartbeat */
     bool heartbeat_enabled;
@@ -309,10 +312,40 @@ nc_tool nc_tool_apply_patch(const nc_config *cfg);
 nc_tool nc_tool_tool_debug(const nc_config *cfg);
 nc_tool nc_tool_file_read(const nc_config *cfg);
 nc_tool nc_tool_file_write(const nc_config *cfg);
+nc_tool nc_tool_web_fetch(const nc_config *cfg);
 nc_tool nc_tool_memory_store(void *mem_ctx);
 nc_tool nc_tool_memory_recall(void *mem_ctx);
 
+/* External tools: each subdirectory of cfg->tools_dir with a tool.json
+ * manifest and an executable `run` is registered as a tool. Appends to
+ * tools[count..max) and returns the new count. Invalid tools are skipped
+ * with a warning; when `report` is non-NULL, one line per tool (loaded or
+ * skipped, with the reason) is written to it. */
+int nc_ext_tools_load(const nc_config *cfg, nc_tool *tools, int count, int max,
+                      FILE *report);
+
 #define NC_MAX_TOOLS 32
+
+/* Run a child process with a timeout (used by shell and external tools). */
+typedef struct nc_proc_opts {
+    const char *const *argv;      /* argv[0] must be an absolute path */
+    const char *cwd;              /* working directory, or NULL to inherit */
+    const char *stdin_data;       /* bytes for stdin, or NULL for /dev/null */
+    size_t      stdin_len;
+    const char *const *env;       /* extra "KEY=VALUE" entries, NULL-terminated, or NULL */
+    int         timeout_seconds;  /* <= 0 means 60 */
+} nc_proc_opts;
+
+typedef struct nc_proc_result {
+    int  status;     /* waitpid status */
+    bool timed_out;
+    bool truncated;
+} nc_proc_result;
+
+bool nc_run_process(const nc_proc_opts *opts, char *out, size_t out_cap,
+                    nc_proc_result *result);
+bool nc_proc_annotate(const nc_proc_result *result, int timeout_seconds,
+                      char *out, size_t out_cap);
 
 /* ── Memory vtable ────────────────────────────────────────────── */
 
@@ -375,13 +408,25 @@ typedef struct nc_http_response {
     char  *body;
     size_t body_len;
     size_t body_cap;
+    size_t max_body;          /* 0 = unlimited */
+    bool   truncated;         /* body was cut at max_body */
+    bool   blocked;           /* every resolved address was private (block_private) */
+    char   location[1024];    /* Location header, if any */
+    char   content_type[128]; /* Content-Type header, if any */
 } nc_http_response;
+
+typedef struct nc_http_get_opts {
+    size_t max_body;      /* stop reading after this many body bytes (0 = unlimited) */
+    bool   block_private; /* refuse loopback/private/link-local addresses */
+} nc_http_get_opts;
 
 bool nc_http_post(const char *url, const char *body, size_t body_len,
                   const char **headers, int header_count,
                   nc_http_response *resp);
 bool nc_http_get(const char *url, const char **headers, int header_count,
                  nc_http_response *resp);
+bool nc_http_get_ex(const char *url, const char **headers, int header_count,
+                    const nc_http_get_opts *opts, nc_http_response *resp);
 void nc_http_set_timeout(int timeout_seconds);
 void nc_http_response_free(nc_http_response *resp);
 
@@ -443,6 +488,7 @@ void nc_test_http(void);
 void nc_test_tools(void);
 void nc_test_agent(void);
 void nc_test_tools_utf8(void);
+void nc_test_web_fetch(void);
 void nc_test_provider(void);
 #endif
 

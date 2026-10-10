@@ -1,0 +1,6 @@
+{
+  "name": "system_info",
+  "description": "Report host name, OS, uptime, load, memory and free disk space for the workspace.",
+  "parameters": { "type": "object", "properties": {} },
+  "timeout_seconds": 10
+}

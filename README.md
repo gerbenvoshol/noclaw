@@ -34,7 +34,8 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 
 - **3 providers.** OpenAI-compatible (OpenRouter, Ollama, LM Studio, etc.), Anthropic, and Gemini. Adding a new one is filling in a vtable struct.
 - **4 channels.** CLI, Telegram, Discord, Slack. Channels are a vtable, add more as needed.
-- **5 tools.** shell, file_read, file_write, memory_store, memory_recall. Same pattern, add more as needed.
+- **7 built-in tools.** shell, apply_patch, file_read, file_write, web_fetch, memory_store, memory_recall.
+- **External tools.** Drop an executable plus a `tool.json` manifest into `~/.noclaw/tools/` and the agent gets a new tool, in any language, without recompiling. See [External tools](#external-tools).
 - **Flat-file memory with keyword search.** The LLM is the ranker. No SQL engine, no embeddings, no vector DB.
 - **HTTP gateway.** /health, /pair, /webhook. Pairing codes, bearer tokens, 127.0.0.1 by default.
 - **324 KB peak RSS.** Less memory than a favicon.
@@ -165,7 +166,7 @@ Every subsystem is a **function-pointer vtable** -- swap implementations at buil
 | **AI Models** | `nc_provider` | OpenAI-compatible (OpenRouter, Ollama, LM Studio, …), Anthropic, Gemini | Any OpenAI-compatible API |
 | **Channels**  | `nc_channel`  | CLI, Telegram, Discord, Slack                             | Any chat platform             |
 | **Memory**    | `nc_memory`   | Flat-file (keyword search)                                | Custom backends               |
-| **Tools**     | `nc_tool`     | shell, file_read, file_write, memory_store, memory_recall | Any capability                |
+| **Tools**     | `nc_tool`     | shell, apply_patch, file_read, file_write, web_fetch, memory_store, memory_recall | External tools in `~/.noclaw/tools/` |
 | **Gateway**   | HTTP server   | /health, /pair, /webhook                                  | Tunnel integration            |
 
 ### Security (mirrors nullclaw/zeroclaw)
@@ -204,7 +205,8 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
     "workspace_only": true,
     "max_actions_per_hour": 20,
     "max_iterations": 50,
-    "shell_timeout_seconds": 60
+    "shell_timeout_seconds": 60,
+    "web_fetch_allow_private": false
   },
   "heartbeat": {
     "enabled": false,
@@ -239,7 +241,11 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
 
 **`default_temperature`** is optional. When omitted, the provider uses its own default. Valid range is `0.0`–`2.0`. Can also be set via `NOCLAW_TEMPERATURE`.
 
-**`autonomy.shell_timeout_seconds`** (default `60`) limits how long a single `shell` tool call may run. On timeout the command's whole process group is killed and the model gets the output so far plus a timeout notice. Shell commands run with stdin set to `/dev/null`. Can also be set via `NOCLAW_SHELL_TIMEOUT`.
+**`autonomy.shell_timeout_seconds`** (default `60`) limits how long a single `shell` tool call may run. On timeout the command's whole process group is killed and the model gets the output so far plus a timeout notice. Shell commands run with stdin set to `/dev/null`. Can also be set via `NOCLAW_SHELL_TIMEOUT`. It is also the default timeout for external tools.
+
+**`autonomy.web_fetch_allow_private`** (default `false`) lets `web_fetch` reach loopback, private-network and link-local addresses (e.g. `localhost`, `192.168.x.x`, the `169.254.169.254` cloud metadata service). By default those are refused, checked against the address actually connected to, so a public hostname that resolves to an internal IP is refused too. Enable it only if the agent should read internal web services.
+
+**`tools_dir`** (default `~/.noclaw/tools`) is where external tools are loaded from. Can also be set via `NOCLAW_TOOLS_DIR`.
 
 **`max_tokens`** controls the maximum number of output tokens per request. noclaw maps this to the correct API parameter based on the endpoint: requests to `https://api.openai.com` (or any path under it, such as `/v1`) use `max_completion_tokens` (required by newer OpenAI models like o1/o3/o4); all other endpoints (OpenRouter, Anthropic, Gemini, Ollama, etc.) use `max_tokens`. When you set `provider: openai`, the API URL defaults to `https://api.openai.com/v1` automatically. Can also be set via `NOCLAW_MAX_TOKENS`.
 
@@ -256,7 +262,80 @@ For local models, omit `api_key` and set `api_url` instead:
 }
 ```
 
-Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_HTTP_TIMEOUT`, `NOCLAW_SHELL_TIMEOUT`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
+Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_HTTP_TIMEOUT`, `NOCLAW_SHELL_TIMEOUT`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_TOOLS_DIR`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
+
+## Tools
+
+| Tool            | What it does |
+| --------------- | ------------ |
+| `shell`         | Run a shell command in the workspace (timeout: `autonomy.shell_timeout_seconds`) |
+| `apply_patch`   | Apply a unified diff to files in the workspace |
+| `file_read`     | Read a file |
+| `file_write`    | Write a file (workspace only by default) |
+| `web_fetch`     | Fetch an http(s) URL and return readable text: HTML is converted to plain text with headings, list items and link targets kept; JSON, XML and plain text pass through; binary content is refused. Follows up to 5 redirects, downloads at most 2 MB, returns 20,000 characters by default (`max_chars` to change). Private and local addresses are refused unless `autonomy.web_fetch_allow_private` is set |
+| `memory_store`  | Save a note to long-term memory |
+| `memory_recall` | Search long-term memory |
+
+## External tools
+
+Any executable can become a tool. Each subdirectory of `~/.noclaw/tools/` that contains a `tool.json` manifest and an executable called `run` is registered at startup, next to the built-in tools. The model sees it as a normal tool with a name, description and parameter schema; no recompiling.
+
+```
+~/.noclaw/tools/
+  sqlite_query/
+    tool.json
+    run          (chmod +x; any language)
+```
+
+**`tool.json`**
+
+```json
+{
+  "name": "sqlite_query",
+  "description": "Run a read-only SQL query against an SQLite database in the workspace.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "database": { "type": "string", "description": "Path relative to the workspace" },
+      "sql":      { "type": "string", "description": "A single SELECT statement" }
+    },
+    "required": ["database", "sql"]
+  },
+  "timeout_seconds": 30
+}
+```
+
+| Field             | Required | Meaning |
+| ----------------- | -------- | ------- |
+| `name`            | yes      | Tool name the model calls: 1-64 characters of `A-Z a-z 0-9 _ -`, must not clash with another tool |
+| `description`     | yes      | What the tool does and when to use it. The model relies on this, so be specific |
+| `parameters`      | no       | JSON Schema for the arguments (default: no arguments). Passed to the provider unchanged, so `enum`, `items` and nested objects work |
+| `timeout_seconds` | no       | 1-86400 (default: `autonomy.shell_timeout_seconds`) |
+
+**How `run` is called**
+
+- The tool arguments arrive as a JSON object on **stdin**, exactly as the model produced them.
+- Everything written to **stdout and stderr** becomes the tool result (up to 256 KB).
+- **Exit status 0** means success; anything else is reported to the model as an error, with `[exit code: N]` appended.
+- The working directory is the **workspace**. The environment adds `NOCLAW_WORKSPACE` (absolute workspace path) and `NOCLAW_TOOL_DIR` (the tool's own directory, for bundled data files).
+- On timeout the tool's whole process group is killed.
+
+A minimal tool in shell, with no parameters:
+
+```sh
+#!/bin/sh
+df -h "$NOCLAW_WORKSPACE"
+```
+
+Working examples are in [`examples/tools/`](examples/tools): `system_info` (shell, no parameters) and `sqlite_query` (Python, parses its JSON arguments and opens the database read-only). To install one:
+
+```sh
+mkdir -p ~/.noclaw/tools
+cp -r examples/tools/sqlite_query ~/.noclaw/tools/
+noclaw doctor     # lists every external tool as OK or SKIPPED with the reason
+```
+
+**Security.** External tools are trusted code you install yourself: the shell tool's command filter does not apply to them, and they can do anything your user account can. They are only loaded from `tools_dir`, which is outside the workspace, so with the default `workspace_only` the agent cannot create new tools for itself through `file_write`. If you move `tools_dir` inside the workspace, the agent can. Validate arguments inside each tool (for example, keep file paths within `$NOCLAW_WORKSPACE`, as `sqlite_query` does).
 
 ## Gateway API
 
@@ -278,7 +357,7 @@ Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MOD
 | `agent`          | Interactive chat mode     |
 | `gateway`        | Start HTTP gateway server |
 | `status`         | Show system status        |
-| `doctor`         | Run diagnostics           |
+| `doctor`         | Run diagnostics (also checks external tools) |
 
 ## Development
 
@@ -286,7 +365,7 @@ Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MOD
 make release     # Release build (~80-88 KB dynamic)
 make musl        # Static musl build (324 KB RSS, zero deps, Linux only)
 make debug       # Debug build with ASan/UBSan
-make test        # Run test suite (87 tests)
+make test        # Run test suite
 make size        # Size report
 make clean       # Clean build artifacts
 ```
@@ -304,7 +383,8 @@ src/
   http.c       HTTP client (platform TLS)
   provider.c   Provider vtable: OpenAI-compatible + Anthropic + Gemini
   channel.c    Channel vtable: CLI, Telegram, Discord, Slack
-  tools.c      Tool vtable: shell, file_read, file_write, memory
+  tools.c      Tool vtable: shell, apply_patch, file_read, file_write, web_fetch, memory
+  ext_tools.c  External tools loaded from ~/.noclaw/tools (tool.json + run)
   memory.c     Memory vtable: flat-file keyword search
   agent.c      Agent loop: conversation history + tool dispatch
   gateway.c    HTTP gateway server: /health, /pair, /webhook
@@ -317,7 +397,7 @@ src/
 Language:       C11
 Source files:   14
 Lines of code:  ~5,350
-Tests:          87
+Tests:          227
 Binary:         ~270 KB static musl (Linux), ~88 KB dynamic (macOS arm64)
 Peak RSS:       324 KB (Linux musl), ~1.9 MB (Linux glibc), ~5.6 MB (macOS)
 Startup:        idk man (no 0.8 GHz test hardware)

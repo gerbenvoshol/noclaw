@@ -1,0 +1,10 @@
+#!/bin/sh
+# noclaw external tool: no parameters, so stdin ({}) is ignored.
+echo "host:   $(hostname)"
+echo "os:     $(uname -srm)"
+echo "uptime: $(uptime)"
+if [ -r /proc/meminfo ]; then
+    awk '/^MemTotal|^MemAvailable/ { printf "%-14s %d MB\n", $1, $2 / 1024 }' /proc/meminfo
+fi
+echo
+df -h "$NOCLAW_WORKSPACE"

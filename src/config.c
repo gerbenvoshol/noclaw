@@ -17,6 +17,7 @@ void nc_config_defaults(nc_config *cfg) {
     nc_path_join(cfg->config_dir, sizeof(cfg->config_dir), home, NC_CONFIG_DIR);
     nc_path_join(cfg->config_path, sizeof(cfg->config_path), cfg->config_dir, NC_CONFIG_FILE);
     nc_path_join(cfg->workspace_dir, sizeof(cfg->workspace_dir), cfg->config_dir, NC_WORKSPACE_DIR);
+    nc_path_join(cfg->tools_dir, sizeof(cfg->tools_dir), cfg->config_dir, NC_TOOLS_DIR);
     cfg->instructions_file[0] = '\0';
 
     /* Provider */
@@ -44,6 +45,7 @@ void nc_config_defaults(nc_config *cfg) {
     cfg->max_actions_per_hour = 20;
     cfg->max_iterations = 50;
     cfg->shell_timeout_seconds = 60;
+    cfg->web_fetch_allow_private = false;
 
     /* Heartbeat */
     cfg->heartbeat_enabled = false;
@@ -96,6 +98,8 @@ bool nc_config_load(nc_config *cfg) {
     nc_json *v;
     if ((v = nc_json_get(root, "workspace_dir")))
         str_to_buf(cfg->workspace_dir, sizeof(cfg->workspace_dir), nc_json_str(v, ""));
+    if ((v = nc_json_get(root, "tools_dir")))
+        str_to_buf(cfg->tools_dir, sizeof(cfg->tools_dir), nc_json_str(v, ""));
 
     if ((v = nc_json_get(root, "api_key")))
         str_to_buf(cfg->api_key, sizeof(cfg->api_key), nc_json_str(v, ""));
@@ -153,6 +157,8 @@ bool nc_config_load(nc_config *cfg) {
             cfg->max_iterations = (int)nc_json_num(v, 50);
         if ((v = nc_json_get(aut, "shell_timeout_seconds")))
             cfg->shell_timeout_seconds = (int)nc_json_num(v, 60);
+        if ((v = nc_json_get(aut, "web_fetch_allow_private")))
+            cfg->web_fetch_allow_private = nc_json_bool(v, false);
     }
 
     /* Heartbeat section */
@@ -247,6 +253,7 @@ bool nc_config_save(const nc_config *cfg) {
     if (cfg->api_url[0])
         nc_jw_str(&w, "api_url", cfg->api_url);
     nc_jw_str(&w, "workspace_dir", cfg->workspace_dir);
+    nc_jw_str(&w, "tools_dir", cfg->tools_dir);
     if (cfg->instructions_file[0])
         nc_jw_str(&w, "instructions_file", cfg->instructions_file);
     nc_jw_str(&w, "default_provider", cfg->default_provider);
@@ -289,16 +296,18 @@ bool nc_config_save(const nc_config *cfg) {
     /* Autonomy */
     nc_jw_raw(&w, "autonomy", "{");
     {
-        char tmp[256];
+        char tmp[512];
         snprintf(tmp, sizeof(tmp),
             "\n    \"level\": \"%s\",\n    \"workspace_only\": %s,\n"
             "    \"max_actions_per_hour\": %d,\n    \"max_iterations\": %d,\n"
-            "    \"shell_timeout_seconds\": %d\n  }",
+            "    \"shell_timeout_seconds\": %d,\n"
+            "    \"web_fetch_allow_private\": %s\n  }",
             cfg->autonomy_level,
             cfg->workspace_only ? "true" : "false",
             cfg->max_actions_per_hour,
             cfg->max_iterations,
-            cfg->shell_timeout_seconds);
+            cfg->shell_timeout_seconds,
+            cfg->web_fetch_allow_private ? "true" : "false");
         size_t tl = strlen(tmp);
         if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
     }
@@ -449,6 +458,8 @@ void nc_config_apply_env(nc_config *cfg) {
     }
     if ((v = getenv("NOCLAW_GATEWAY_HOST")))
         nc_strlcpy(cfg->gateway_host, v, sizeof(cfg->gateway_host));
+    if ((v = getenv("NOCLAW_TOOLS_DIR")))
+        nc_strlcpy(cfg->tools_dir, v, sizeof(cfg->tools_dir));
     if ((v = getenv("NOCLAW_WORKSPACE")))
         nc_strlcpy(cfg->workspace_dir, v, sizeof(cfg->workspace_dir));
     if ((v = getenv("NOCLAW_INSTRUCTIONS_FILE")))

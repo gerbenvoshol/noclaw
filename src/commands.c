@@ -56,6 +56,18 @@ static nc_provider make_provider(const nc_config *cfg) {
                               cfg->api_mode, cfg->reasoning_effort);
 }
 
+static int add_builtin_tools(const nc_config *cfg, nc_memory *mem, nc_tool *tools) {
+    int n = 0;
+    tools[n++] = nc_tool_shell(cfg);
+    tools[n++] = nc_tool_apply_patch(cfg);
+    tools[n++] = nc_tool_file_read(cfg);
+    tools[n++] = nc_tool_file_write(cfg);
+    tools[n++] = nc_tool_web_fetch(cfg);
+    tools[n++] = nc_tool_memory_store(mem);
+    tools[n++] = nc_tool_memory_recall(mem);
+    return n;
+}
+
 static void make_agent_stack(nc_config *cfg, nc_provider *prov, nc_memory *mem,
                              nc_tool *tools, int *tool_count, nc_agent *agent) {
     char mem_path[1024];
@@ -63,15 +75,17 @@ static void make_agent_stack(nc_config *cfg, nc_provider *prov, nc_memory *mem,
     nc_path_join(mem_path, sizeof(mem_path), cfg->workspace_dir, "memories.tsv");
     *mem = nc_memory_flat(mem_path);
 
-    *tool_count = 0;
-    tools[(*tool_count)++] = nc_tool_shell(cfg);
-    tools[(*tool_count)++] = nc_tool_apply_patch(cfg);
-    tools[(*tool_count)++] = nc_tool_file_read(cfg);
-    tools[(*tool_count)++] = nc_tool_file_write(cfg);
-    tools[(*tool_count)++] = nc_tool_memory_store(mem);
-    tools[(*tool_count)++] = nc_tool_memory_recall(mem);
+    *tool_count = add_builtin_tools(cfg, mem, tools);
+    *tool_count = nc_ext_tools_load(cfg, tools, *tool_count, NC_MAX_TOOLS, NULL);
 
     nc_agent_init(agent, cfg, prov, tools, *tool_count, mem);
+}
+
+static void free_tools(nc_tool *tools, int tool_count) {
+    for (int i = 0; i < tool_count; i++) {
+        if (tools[i].free)
+            tools[i].free(&tools[i]);
+    }
 }
 
 int nc_cmd_agent(int argc, char **argv) {
@@ -95,7 +109,7 @@ int nc_cmd_agent(int argc, char **argv) {
     if (opts.message_file) {
         size_t file_len = 0;
         file_msg = nc_read_file(opts.message_file, &file_len);
-        if (!file_msg) { fprintf(stderr, "Cannot read message file: %s\n", opts.message_file); nc_agent_free(&agent); mem.free(&mem); if (prov.free) prov.free(&prov); return 1; }
+        if (!file_msg) { fprintf(stderr, "Cannot read message file: %s\n", opts.message_file); nc_agent_free(&agent); free_tools(tools, tool_count); mem.free(&mem); if (prov.free) prov.free(&prov); return 1; }
         single_msg = file_msg;
     }
 
@@ -121,7 +135,10 @@ int nc_cmd_agent(int argc, char **argv) {
         printf("  Model:     %s\n", cfg.default_model);
         printf("  Workspace: %s\n", cfg.workspace_dir);
         if (cfg.instructions_file[0]) printf("  Instr:     %s\n", cfg.instructions_file);
-        printf("  Tools:     %d loaded\n\n", tool_count);
+        printf("  Tools:    ");
+        for (int i = 0; i < tool_count; i++)
+            printf(" %s%s", tools[i].def.name, i + 1 < tool_count ? "," : "");
+        printf("\n\n");
         nc_incoming_msg msg;
         while (ch.poll(&ch, &msg)) {
             if (strcmp(msg.content, "/quit") == 0 || strcmp(msg.content, "/exit") == 0) break;
@@ -132,7 +149,7 @@ int nc_cmd_agent(int argc, char **argv) {
         }
         ch.free(&ch);
     }
-    nc_agent_free(&agent); mem.free(&mem); if (prov.free) prov.free(&prov); free(file_msg); return 0;
+    nc_agent_free(&agent); free_tools(tools, tool_count); mem.free(&mem); if (prov.free) prov.free(&prov); free(file_msg); return 0;
 }
 
 /* ── Gateway command ──────────────────────────────────────────── */
@@ -169,6 +186,7 @@ int nc_cmd_gateway(int argc, char **argv) {
     nc_gateway_run(&gw);
 
     nc_agent_free(&agent);
+    free_tools(tools, tool_count);
     mem.free(&mem);
     if (prov.free) prov.free(&prov);
     return 0;
@@ -423,6 +441,18 @@ int nc_cmd_doctor(int argc, char **argv) {
 
     /* Memory */
     printf("  Memory:         flat-file (keyword search)\n");
+
+    /* External tools: load them the same way the agent does and report
+     * each one, so manifest mistakes show up here instead of silently. */
+    if (loaded) {
+        nc_tool tools[NC_MAX_TOOLS];
+        nc_memory none = nc_memory_noop();
+        int builtin = add_builtin_tools(&cfg, &none, tools);
+        int n;
+        printf("  External tools: %s\n", cfg.tools_dir);
+        n = nc_ext_tools_load(&cfg, tools, builtin, NC_MAX_TOOLS, stdout);
+        free_tools(tools, n);
+    }
 
     /* Summary */
     printf("\n");

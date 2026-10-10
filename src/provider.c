@@ -203,12 +203,14 @@ static char *openai_responses_tools_json(const char *tools_json) {
         nc_json *params = nc_json_get(fn, "parameters");
         nc_str params_raw = nc_json_get_slice(arr, params);
 
-        char name_tmp[128], desc_tmp[512];
+        char name_tmp[128], desc_tmp[4096];
         size_t n = name.len < sizeof(name_tmp) - 1 ? name.len : sizeof(name_tmp) - 1;
         if (n && name.ptr)
             memcpy(name_tmp, name.ptr, n);
         name_tmp[n] = '\0';
         n = desc.len < sizeof(desc_tmp) - 1 ? desc.len : sizeof(desc_tmp) - 1;
+        if (n && desc.ptr)
+            n = nc_utf8_safe_prefix(desc.ptr, desc.len, n);
         if (n && desc.ptr)
             memcpy(desc_tmp, desc.ptr, n);
         desc_tmp[n] = '\0';
@@ -1001,49 +1003,32 @@ static const char *anthropic_tools_json_from_defs(char *buf, size_t bufsz,
         if (!fn) continue;
         nc_str name = nc_json_str(nc_json_get(fn, "name"), "");
         nc_str desc = nc_json_str(nc_json_get(fn, "description"), "");
-
-        off = append_snprintf(buf, bufsz, off,
-            "{\"name\":\"%.*s\",\"description\":\"%.*s\",\"input_schema\":",
-            NC_STR_ARG(name), NC_STR_ARG(desc));
-
-        /* The parameters value is a JSON object in the parsed tree.
-         * We need to re-serialize it. Since our JSON library doesn't have a writer
-         * for nc_json nodes, find the raw text in the original tools_json string.
-         *
-         * Alternative: find "parameters" in the raw string for this tool. */
-        nc_json *params = nc_json_get(fn, "parameters");
-        if (params && params->type == NC_JSON_OBJECT) {
-            /* Re-build a minimal JSON object from the parsed structure */
-            off = append_snprintf(buf, bufsz, off, "{\"type\":\"object\",\"properties\":{");
-            nc_json *props = nc_json_get(params, "properties");
-            if (props && props->type == NC_JSON_OBJECT) {
-                for (int k = 0; k < props->object.count; k++) {
-                    if (k > 0) buf[off++] = ',';
-                    nc_str pname = props->object.keys[k];
-                    nc_json *pval = &props->object.vals[k];
-                    nc_str ptype = nc_json_str(nc_json_get(pval, "type"), "string");
-                    nc_str pdesc = nc_json_str(nc_json_get(pval, "description"), "");
-                    off = append_snprintf(buf, bufsz, off,
-                        "\"%.*s\":{\"type\":\"%.*s\",\"description\":\"%.*s\"}",
-                        NC_STR_ARG(pname), NC_STR_ARG(ptype), NC_STR_ARG(pdesc));
-                }
-            }
-            off = append_snprintf(buf, bufsz, off, "}");
-            /* required */
-            nc_json *req_arr = nc_json_get(params, "required");
-            if (req_arr && req_arr->type == NC_JSON_ARRAY && req_arr->array.count > 0) {
-                off = append_snprintf(buf, bufsz, off, ",\"required\":[");
-                for (int k = 0; k < req_arr->array.count; k++) {
-                    if (k > 0) buf[off++] = ',';
-                    nc_str rname = req_arr->array.items[k].string;
-                    off = append_snprintf(buf, bufsz, off, "\"%.*s\"", NC_STR_ARG(rname));
-                }
-                off = append_snprintf(buf, bufsz, off, "]");
-            }
-            off = append_snprintf(buf, bufsz, off, "}");
-        } else {
-            off = append_snprintf(buf, bufsz, off, "{\"type\":\"object\"}");
+        char *name_z = nc_strdup_n(name.ptr, name.len);
+        char *desc_z = nc_strdup_n(desc.ptr, desc.len);
+        if (!name_z || !desc_z) {
+            free(name_z);
+            free(desc_z);
+            nc_arena_free(&scratch);
+            return NULL;
         }
+
+        /* The parser decodes escapes, so re-escape name/description; the
+         * parameters schema is passed through verbatim from the source text
+         * so nested schemas (enum, items, objects) survive. */
+        off = append_snprintf(buf, bufsz, off, "{\"name\":");
+        off = append_json_str(buf, bufsz, off, name_z);
+        off = append_snprintf(buf, bufsz, off, ",\"description\":");
+        off = append_json_str(buf, bufsz, off, desc_z);
+        off = append_snprintf(buf, bufsz, off, ",\"input_schema\":");
+        free(name_z);
+        free(desc_z);
+
+        nc_json *params = nc_json_get(fn, "parameters");
+        nc_str params_raw = nc_json_get_slice(arr, params);
+        if (params && params->type == NC_JSON_OBJECT && params_raw.ptr && params_raw.len > 0)
+            off = append_snprintf(buf, bufsz, off, "%.*s", NC_STR_ARG(params_raw));
+        else
+            off = append_snprintf(buf, bufsz, off, "{\"type\":\"object\"}");
 
         off = append_snprintf(buf, bufsz, off, "}");
     }
@@ -1353,7 +1338,39 @@ nc_provider nc_provider_anthropic(const char *api_key, const char *api_url) {
 }
 
 #ifdef NC_TEST
+static void test_anthropic_tools(void) {
+    const char *tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"pick\","
+        "\"description\":\"Choose \\\"one\\\"\\nonly\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"color\":{\"type\":\"string\",\"enum\":[\"red\",\"blue\"]},"
+        "\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+        "\"required\":[\"color\"]}}}]";
+    nc_chat_request req = { .tools_json = tools };
+    char buf[4096];
+    nc_arena a;
+
+    NC_ASSERT(anthropic_tools_json_from_defs(buf, sizeof(buf), &req) != NULL,
+              "anthropic tools conversion succeeds");
+    nc_arena_init(&a, 4096);
+    nc_json *arr = nc_json_parse(&a, buf, strlen(buf));
+    nc_json *t = arr && arr->type == NC_JSON_ARRAY && arr->array.count == 1
+        ? &arr->array.items[0] : NULL;
+    nc_json *schema = t ? nc_json_get(t, "input_schema") : NULL;
+    nc_json *color = schema ? nc_json_get(nc_json_get(schema, "properties"), "color") : NULL;
+    nc_json *tags = schema ? nc_json_get(nc_json_get(schema, "properties"), "tags") : NULL;
+    NC_ASSERT(t != NULL, "anthropic tools JSON parses with quotes in description");
+    NC_ASSERT(t && nc_str_eql(nc_json_str(nc_json_get(t, "description"), ""), "Choose \"one\"\nonly"),
+              "anthropic tool description round-trips");
+    NC_ASSERT(color && nc_json_get(color, "enum") && nc_json_get(color, "enum")->array.count == 2,
+              "anthropic schema keeps enum");
+    NC_ASSERT(tags && nc_json_get(tags, "items"), "anthropic schema keeps array items");
+    nc_arena_free(&a);
+}
+
 void nc_test_provider(void) {
+    test_anthropic_tools();
+
     char escaped[128] = {0};
     const char invalid[] = { 'x', (char)0xff, 'y', '\0' };
 

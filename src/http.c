@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/time.h>
@@ -98,8 +99,44 @@ static bool parse_url(const char *url, parsed_url *out) {
 
 /* ── TCP connect ──────────────────────────────────────────────── */
 
-static int tcp_connect(const char *host, const char *port) {
+/* Loopback, private, link-local (incl. cloud metadata), CGNAT, multicast and
+ * reserved ranges. IPv4-mapped IPv6 addresses are checked as IPv4. */
+static bool addr_is_private(const struct sockaddr *sa) {
+    if (sa->sa_family == AF_INET) {
+        const unsigned char *b =
+            (const unsigned char *)&((const struct sockaddr_in *)sa)->sin_addr;
+        return b[0] == 0 || b[0] == 10 || b[0] == 127 ||
+               (b[0] == 100 && (b[1] & 0xc0) == 64) ||
+               (b[0] == 169 && b[1] == 254) ||
+               (b[0] == 172 && (b[1] & 0xf0) == 16) ||
+               (b[0] == 192 && b[1] == 168) ||
+               b[0] >= 224;
+    }
+    if (sa->sa_family == AF_INET6) {
+        const unsigned char *b =
+            ((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr;
+        static const unsigned char mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const unsigned char zero[15] = {0};
+        if (memcmp(b, mapped, 12) == 0) {
+            struct sockaddr_in v4;
+            memset(&v4, 0, sizeof(v4));
+            v4.sin_family = AF_INET;
+            memcpy(&v4.sin_addr, b + 12, 4);
+            return addr_is_private((const struct sockaddr *)&v4);
+        }
+        if (memcmp(b, zero, 15) == 0 && (b[15] == 0 || b[15] == 1))
+            return true;                      /* :: and ::1 */
+        return (b[0] & 0xfe) == 0xfc ||        /* fc00::/7 unique local */
+               (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) || /* fe80::/10 */
+               b[0] == 0xff;                   /* multicast */
+    }
+    return true;
+}
+
+static int tcp_connect_ex(const char *host, const char *port,
+                          bool block_private, bool *blocked) {
     struct addrinfo hints, *res, *rp;
+    bool any_allowed = false;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -112,6 +149,11 @@ static int tcp_connect(const char *host, const char *port) {
 
     int fd = -1;
     for (rp = res; rp != NULL; rp = rp->ai_next) {
+        /* Checked per resolved address (not per hostname), so a public name
+         * that resolves to an internal IP is refused too. */
+        if (block_private && addr_is_private(rp->ai_addr))
+            continue;
+        any_allowed = true;
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
 
@@ -129,10 +171,19 @@ static int tcp_connect(const char *host, const char *port) {
 
     freeaddrinfo(res);
 
+    if (block_private && !any_allowed) {
+        if (blocked) *blocked = true;
+        nc_log(NC_LOG_WARN, "Refusing to connect to private address for %s", host);
+        return -1;
+    }
     if (fd < 0)
         nc_log(NC_LOG_ERROR, "TCP connect failed to %s:%s", host, port);
 
     return fd;
+}
+
+static int tcp_connect(const char *host, const char *port) {
+    return tcp_connect_ex(host, port, false, NULL);
 }
 
 /* ── TLS wrapper ──────────────────────────────────────────────── */
@@ -624,6 +675,16 @@ static void resp_init(nc_http_response *resp) {
 }
 
 static void resp_append(nc_http_response *resp, const char *data, size_t len) {
+    if (resp->max_body) {
+        if (resp->body_len >= resp->max_body) {
+            if (len > 0) resp->truncated = true;
+            return;
+        }
+        if (len > resp->max_body - resp->body_len) {
+            len = resp->max_body - resp->body_len;
+            resp->truncated = true;
+        }
+    }
     while (resp->body_len + len + 1 > resp->body_cap) {
         size_t new_cap = resp->body_cap ? resp->body_cap * 2 : 16384;
         char *nb = (char *)realloc(resp->body, new_cap);
@@ -696,6 +757,19 @@ static bool read_response(tls_conn *c, nc_http_response *resp) {
                 content_length = (size_t)atol(h + 15);
                 has_content_length = true;
             }
+            if (strncasecmp(h, "Location:", 9) == 0 ||
+                strncasecmp(h, "Content-Type:", 13) == 0) {
+                bool is_loc = (h[0] == 'L' || h[0] == 'l');
+                char *dst = is_loc ? resp->location : resp->content_type;
+                size_t cap = is_loc ? sizeof(resp->location) : sizeof(resp->content_type);
+                const char *v = h + (is_loc ? 9 : 13);
+                const char *eol = strstr(v, "\r\n");
+                while (*v == ' ' || *v == '\t') v++;
+                size_t vlen = eol && eol > v ? (size_t)(eol - v) : 0;
+                if (vlen >= cap) vlen = cap - 1;
+                memcpy(dst, v, vlen);
+                dst[vlen] = '\0';
+            }
             if (strncasecmp(h, "Transfer-Encoding:", 18) == 0) {
                 /* Scope search to this header line only (not into body) */
                 const char *eol = strstr(h, "\r\n");
@@ -732,6 +806,12 @@ static bool read_response(tls_conn *c, nc_http_response *resp) {
             if (n <= 0) break;
             raw_len += (size_t)n;
             raw[raw_len] = '\0';
+
+            /* Bound memory: chunk framing adds little beyond the body. */
+            if (resp->max_body && raw_len > resp->max_body + 65536) {
+                resp->truncated = true;
+                break;
+            }
 
             /* Check for final chunk (0\r\n\r\n) */
             {
@@ -771,7 +851,7 @@ static bool read_response(tls_conn *c, nc_http_response *resp) {
         /* Read remaining body by Content-Length */
         resp_append(resp, body_start, body_so_far);
 
-        while (resp->body_len < content_length) {
+        while (resp->body_len < content_length && !resp->truncated) {
             char buf[4096];
             size_t want = content_length - resp->body_len;
             if (want > sizeof(buf)) want = sizeof(buf);
@@ -782,7 +862,7 @@ static bool read_response(tls_conn *c, nc_http_response *resp) {
     } else {
         /* Read until connection close */
         resp_append(resp, body_start, body_so_far);
-        while (1) {
+        while (!resp->truncated) {
             char buf[4096];
             ssize_t n = tls_read(c, buf, sizeof(buf));
             if (n <= 0) break;
@@ -898,7 +978,14 @@ bool nc_http_post(const char *url, const char *body, size_t body_len,
 
 bool nc_http_get(const char *url, const char **headers, int header_count,
                  nc_http_response *resp) {
+    return nc_http_get_ex(url, headers, header_count, NULL, resp);
+}
+
+bool nc_http_get_ex(const char *url, const char **headers, int header_count,
+                    const nc_http_get_opts *opts, nc_http_response *resp) {
     resp_init(resp);
+    if (opts)
+        resp->max_body = opts->max_body;
 
     parsed_url pu;
     if (!parse_url(url, &pu)) {
@@ -906,7 +993,8 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
         return false;
     }
 
-    int fd = tcp_connect(pu.host, pu.port);
+    int fd = tcp_connect_ex(pu.host, pu.port,
+                            opts && opts->block_private, &resp->blocked);
     if (fd < 0) return false;
 
     tls_conn conn;
@@ -974,8 +1062,33 @@ bool nc_http_get(const char *url, const char **headers, int header_count,
 /* ── Tests ────────────────────────────────────────────────────── */
 
 #ifdef NC_TEST
+static bool test_ip_private(const char *ip) {
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_flags = AI_NUMERICHOST;
+    if (getaddrinfo(ip, NULL, &hints, &res) != 0) return false;
+    bool r = addr_is_private(res->ai_addr);
+    freeaddrinfo(res);
+    return r;
+}
+
 void nc_test_http(void) {
     parsed_url pu;
+
+    NC_ASSERT(test_ip_private("127.0.0.1"), "loopback is private");
+    NC_ASSERT(test_ip_private("10.1.2.3"), "10/8 is private");
+    NC_ASSERT(test_ip_private("172.20.0.1"), "172.16/12 is private");
+    NC_ASSERT(!test_ip_private("172.32.0.1"), "172.32 is public");
+    NC_ASSERT(test_ip_private("192.168.1.1"), "192.168/16 is private");
+    NC_ASSERT(test_ip_private("169.254.169.254"), "metadata address is private");
+    NC_ASSERT(test_ip_private("100.64.0.1"), "CGNAT is private");
+    NC_ASSERT(test_ip_private("0.0.0.0"), "unspecified is private");
+    NC_ASSERT(!test_ip_private("93.184.216.34"), "public IPv4 allowed");
+    NC_ASSERT(test_ip_private("::1"), "IPv6 loopback is private");
+    NC_ASSERT(test_ip_private("fd00::1"), "IPv6 ULA is private");
+    NC_ASSERT(test_ip_private("fe80::1"), "IPv6 link-local is private");
+    NC_ASSERT(test_ip_private("::ffff:127.0.0.1"), "mapped loopback is private");
+    NC_ASSERT(!test_ip_private("2606:4700::1"), "public IPv6 allowed");
 
     /* HTTPS URL */
     NC_ASSERT(parse_url("https://api.openai.com/v1/chat/completions", &pu), "parse https url");

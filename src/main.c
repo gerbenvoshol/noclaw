@@ -31,6 +31,7 @@ int main(void) {
     nc_test_tools();
     nc_test_agent();
     nc_test_tools_utf8();
+    nc_test_web_fetch();
     nc_test_provider();
 
     printf("\n═════════════════\n");

@@ -1,0 +1,14 @@
+{
+  "name": "sqlite_query",
+  "description": "Run a read-only SQL query against an SQLite database file in the workspace and return the rows as tab-separated text.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "database": { "type": "string", "description": "Path to the .db file, relative to the workspace" },
+      "sql": { "type": "string", "description": "A single SELECT statement" },
+      "max_rows": { "type": "integer", "description": "Maximum rows to return (default 100)" }
+    },
+    "required": ["database", "sql"]
+  },
+  "timeout_seconds": 30
+}
