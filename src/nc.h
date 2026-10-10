@@ -402,6 +402,10 @@ char  *nc_strdup(const char *src);
 char  *nc_format(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)));
 
+/* UTF-8 validation and boundary-safe truncation */
+size_t nc_utf8_sequence_len(const char *s, size_t len);
+size_t nc_utf8_safe_prefix(const char *s, size_t len, size_t max_bytes);
+
 /* Get $HOME */
 const char *nc_home_dir(void);
 

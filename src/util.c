@@ -236,5 +236,15 @@ void nc_test_str(void) {
 
     nc_path_join3(buf, sizeof(buf), "/home", ".noclaw", "config.json");
     NC_ASSERT(strcmp(buf, "/home/.noclaw/config.json") == 0, "path_join 3");
+
+    const char *utf8 = "A\xc3\xa9\xe4\xbd\xa0\xf0\x9f\x91\x8b";
+    NC_ASSERT(nc_utf8_safe_prefix(utf8, strlen(utf8), 10) == 10,
+              "utf8 prefix keeps complete sequences");
+    NC_ASSERT(nc_utf8_safe_prefix(utf8, strlen(utf8), 9) == 6,
+              "utf8 prefix drops partial four-byte sequence");
+    NC_ASSERT(nc_utf8_safe_prefix(utf8, strlen(utf8), 2) == 1,
+              "utf8 prefix drops partial two-byte sequence");
+    NC_ASSERT(nc_utf8_sequence_len("\xed\xa0\x80", 3) == 0,
+              "utf8 rejects surrogate code points");
 }
 #endif

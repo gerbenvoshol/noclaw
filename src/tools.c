@@ -123,7 +123,8 @@ static nc_extract_status extract_json_string2(const char *json,
         return NC_EXTRACT_TRUNCATED;
     }
 
-    size_t cplen = s.len < out_cap - 1 ? s.len : out_cap - 1;
+    size_t max_bytes = s.len < out_cap - 1 ? s.len : out_cap - 1;
+    size_t cplen = nc_utf8_safe_prefix(s.ptr, s.len, max_bytes);
     memcpy(out, s.ptr, cplen);
     out[cplen] = '\0';
     nc_arena_free(&a);
@@ -1775,3 +1776,20 @@ nc_tool nc_tool_memory_recall(void *mem_ctx) {
         .free = NULL,
     };
 }
+
+#ifdef NC_TEST
+void nc_test_tools(void) {
+    const char *json = "{\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x91\x8b\"}";
+    char full[16];
+    char truncated[5];
+
+    NC_ASSERT(extract_json_string(json, "content", full, sizeof(full)),
+              "tool args extract UTF-8");
+    NC_ASSERT(strcmp(full, "\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x91\x8b") == 0,
+              "tool args preserve UTF-8");
+    NC_ASSERT(extract_json_string(json, "content", truncated, sizeof(truncated)),
+              "tool args truncate UTF-8");
+    NC_ASSERT(strcmp(truncated, "\xe4\xbd\xa0") == 0,
+              "tool args truncate at UTF-8 boundary");
+}
+#endif
