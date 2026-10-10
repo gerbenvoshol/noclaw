@@ -34,7 +34,7 @@ The absolute smallest fully autonomous AI assistant infrastructure. Until someon
 
 - **3 providers.** OpenAI-compatible (OpenRouter, Ollama, LM Studio, etc.), Anthropic, and Gemini. Adding a new one is filling in a vtable struct.
 - **4 channels.** CLI, Telegram, Discord, Slack. Channels are a vtable, add more as needed.
-- **7 built-in tools.** shell, apply_patch, file_read, file_write, web_fetch, memory_store, memory_recall.
+- **8 built-in tools.** shell, apply_patch, file_read, file_write, file_edit, web_fetch, memory_store, memory_recall.
 - **External tools.** Drop an executable plus a `tool.json` manifest into `~/.noclaw/tools/` and the agent gets a new tool, in any language, without recompiling. See [External tools](#external-tools).
 - **Flat-file memory with keyword search.** The LLM is the ranker. No SQL engine, no embeddings, no vector DB.
 - **HTTP gateway.** /health, /pair, /webhook. Pairing codes, bearer tokens, 127.0.0.1 by default.
@@ -166,7 +166,7 @@ Every subsystem is a **function-pointer vtable** -- swap implementations at buil
 | **AI Models** | `nc_provider` | OpenAI-compatible (OpenRouter, Ollama, LM Studio, …), Anthropic, Gemini | Any OpenAI-compatible API |
 | **Channels**  | `nc_channel`  | CLI, Telegram, Discord, Slack                             | Any chat platform             |
 | **Memory**    | `nc_memory`   | Flat-file (keyword search)                                | Custom backends               |
-| **Tools**     | `nc_tool`     | shell, apply_patch, file_read, file_write, web_fetch, memory_store, memory_recall | External tools in `~/.noclaw/tools/` |
+| **Tools**     | `nc_tool`     | shell, apply_patch, file_read, file_write, file_edit, web_fetch, memory_store, memory_recall | External tools in `~/.noclaw/tools/` |
 | **Gateway**   | HTTP server   | /health, /pair, /webhook                                  | Tunnel integration            |
 
 ### Security (mirrors nullclaw/zeroclaw)
@@ -272,6 +272,7 @@ Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MOD
 | `apply_patch`   | Apply a unified diff to files in the workspace |
 | `file_read`     | Read a file |
 | `file_write`    | Write a file (workspace only by default) |
+| `file_edit`     | Replace an exact string in an existing text file. `old_string` must match exactly and be unique, unless `replace_all` is set; failures explain why (no match, with a hint where the text differs, or the line numbers of every match). The file is replaced atomically with its permissions kept, and the result shows the edited lines with line numbers |
 | `web_fetch`     | Fetch an http(s) URL and return readable text: HTML is converted to plain text with headings, list items and link targets kept; JSON, XML and plain text pass through; binary content is refused. Follows up to 5 redirects, downloads at most 2 MB, returns 20,000 characters by default (`max_chars` to change). Private and local addresses are refused unless `autonomy.web_fetch_allow_private` is set |
 | `memory_store`  | Save a note to long-term memory |
 | `memory_recall` | Search long-term memory |
@@ -383,7 +384,7 @@ src/
   http.c       HTTP client (platform TLS)
   provider.c   Provider vtable: OpenAI-compatible + Anthropic + Gemini
   channel.c    Channel vtable: CLI, Telegram, Discord, Slack
-  tools.c      Tool vtable: shell, apply_patch, file_read, file_write, web_fetch, memory
+  tools.c      Tool vtable: shell, apply_patch, file_read, file_write, file_edit, web_fetch, memory
   ext_tools.c  External tools loaded from ~/.noclaw/tools (tool.json + run)
   memory.c     Memory vtable: flat-file keyword search
   agent.c      Agent loop: conversation history + tool dispatch
@@ -397,7 +398,7 @@ src/
 Language:       C11
 Source files:   14
 Lines of code:  ~5,350
-Tests:          227
+Tests:          253
 Binary:         ~270 KB static musl (Linux), ~88 KB dynamic (macOS arm64)
 Peak RSS:       324 KB (Linux musl), ~1.9 MB (Linux glibc), ~5.6 MB (macOS)
 Startup:        idk man (no 0.8 GHz test hardware)

@@ -62,6 +62,7 @@ static int add_builtin_tools(const nc_config *cfg, nc_memory *mem, nc_tool *tool
     tools[n++] = nc_tool_apply_patch(cfg);
     tools[n++] = nc_tool_file_read(cfg);
     tools[n++] = nc_tool_file_write(cfg);
+    tools[n++] = nc_tool_file_edit(cfg);
     tools[n++] = nc_tool_web_fetch(cfg);
     tools[n++] = nc_tool_memory_store(mem);
     tools[n++] = nc_tool_memory_recall(mem);

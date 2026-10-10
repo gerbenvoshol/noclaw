@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <signal.h>
 #include <time.h>
@@ -646,6 +647,65 @@ static bool path_within_workspace(const char *path,
            (path[n] == '\0' || path[n] == '/');
 }
 
+/* Resolve the path of an existing file for reading or editing. In
+ * workspace mode the fully resolved path (after symlinks) must stay inside
+ * the workspace. On failure writes an error message to err and returns
+ * false. */
+static bool resolve_existing_path(const nc_config *cfg, const char *path,
+                                  char *resolved_out, size_t resolved_cap,
+                                  char *err, size_t err_cap)
+{
+    if (cfg->workspace_only) {
+        char candidate[PATH_MAX];
+        char resolved[PATH_MAX];
+        char workspace[PATH_MAX];
+
+        if (path[0] == '/') {
+            if (nc_strlcpy(candidate, path, sizeof(candidate)) >= sizeof(candidate)) {
+                nc_strlcpy(err, "error: path too long", err_cap);
+                return false;
+            }
+        } else {
+            if (!path_is_safe_relative(path)) {
+                nc_strlcpy(err, "error: path traversal not allowed", err_cap);
+                return false;
+            }
+            if (!nc_path_join(candidate, sizeof(candidate), cfg->workspace_dir, path)) {
+                nc_strlcpy(err, "error: path too long", err_cap);
+                return false;
+            }
+        }
+
+        if (!realpath(candidate, resolved)) {
+            snprintf(err, err_cap, "error: cannot resolve file '%s'", path);
+            return false;
+        }
+        if (!realpath(cfg->workspace_dir, workspace)) {
+            nc_strlcpy(err, "error: invalid workspace path", err_cap);
+            return false;
+        }
+        if (!path_within_workspace(resolved, workspace)) {
+            nc_strlcpy(err, "error: path escapes workspace", err_cap);
+            return false;
+        }
+        if (nc_strlcpy(resolved_out, resolved, resolved_cap) >= resolved_cap) {
+            nc_strlcpy(err, "error: path too long", err_cap);
+            return false;
+        }
+        return true;
+    }
+
+    if (path[0] != '/' && !path_is_safe_relative(path)) {
+        nc_strlcpy(err, "error: path traversal not allowed", err_cap);
+        return false;
+    }
+    if (nc_strlcpy(resolved_out, path, resolved_cap) >= resolved_cap) {
+        nc_strlcpy(err, "error: path too long", err_cap);
+        return false;
+    }
+    return true;
+}
+
 static bool file_read_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
     char path[1024];
@@ -667,70 +727,8 @@ static bool file_read_execute(nc_tool *self, const char *args_json, char *out, s
         return false;
     }
 
-    /* Security: workspace scoping */
-    if (cfg->workspace_only) {
-        char candidate[PATH_MAX];
-        char resolved[PATH_MAX];
-        char workspace[PATH_MAX];
-
-        if (path[0] == '/') {
-            if (nc_strlcpy(candidate, path, sizeof(candidate)) >= sizeof(candidate)) {
-                nc_strlcpy(out, "error: path too long", out_cap);
-                return false;
-            }
-        } else {
-            if (!path_is_safe_relative(path)) {
-                nc_strlcpy(out, "error: path traversal not allowed", out_cap);
-                return false;
-            }
-            if (!nc_path_join(candidate, sizeof(candidate),
-                              cfg->workspace_dir, path)) {
-                nc_strlcpy(out, "error: path too long", out_cap);
-                return false;
-            }
-        }
-
-        if (!realpath(candidate, resolved)) {
-            snprintf(out, out_cap,
-                     "error: cannot resolve file '%s'", path);
-            return false;
-        }
-
-        if (!realpath(cfg->workspace_dir, workspace)) {
-            nc_strlcpy(out,
-                       "error: invalid workspace path",
-                       out_cap);
-            return false;
-        }
-
-        if (!path_within_workspace(resolved, workspace)) {
-            nc_strlcpy(out,
-                       "error: path escapes workspace",
-                       out_cap);
-            return false;
-        }
-
-        if (nc_strlcpy(read_path, resolved, sizeof(read_path)) >= sizeof(read_path)) {
-            nc_strlcpy(out, "error: path too long", out_cap);
-            return false;
-        }
-    } else {
-        if (path[0] == '/') {
-            if (nc_strlcpy(read_path, path, sizeof(read_path)) >= sizeof(read_path)) {
-                nc_strlcpy(out, "error: path too long", out_cap);
-                return false;
-            }
-        } else {
-            if (!path_is_safe_relative(path)) {
-                nc_strlcpy(out, "error: path traversal not allowed", out_cap);
-                return false;
-            }
-            if (nc_strlcpy(read_path, path, sizeof(read_path)) >= sizeof(read_path)) {
-                nc_strlcpy(out, "error: path too long", out_cap);
-                return false;
-            }
-        }
-    }
+    if (!resolve_existing_path(cfg, path, read_path, sizeof(read_path), out, out_cap))
+        return false;
 
     size_t len;
     char *content = nc_read_file(read_path, &len);
@@ -886,6 +884,325 @@ nc_tool nc_tool_file_write(const nc_config *cfg) {
         },
         .ctx = (void *)cfg,
         .execute = file_write_execute,
+        .free = NULL,
+    };
+}
+
+/* ── File edit tool ───────────────────────────────────────────── */
+
+static size_t line_of_offset(const char *s, size_t off) {
+    size_t line = 1;
+    for (size_t i = 0; i < off; i++)
+        if (s[i] == '\n')
+            line++;
+    return line;
+}
+
+static size_t count_occurrences(const char *hay, const char *needle, size_t nlen,
+                                size_t *first_off) {
+    size_t count = 0;
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + nlen, needle)) {
+        if (count == 0 && first_off)
+            *first_off = (size_t)(p - hay);
+        count++;
+    }
+    return count;
+}
+
+/* Explain a failed match: CRLF mismatch, or where the first line of
+ * old_string does occur (so the model can re-read that region). */
+static void edit_not_found_hint(const char *content, const char *old_s,
+                                char *out, size_t out_cap) {
+    const char *nl;
+    char first[256];
+    size_t fl;
+    const char *start = old_s;
+
+    if (strstr(content, "\r\n") && strchr(old_s, '\n') && !strstr(old_s, "\r\n")) {
+        append_suffix(out, out_cap,
+                      " The file uses CRLF (\\r\\n) line endings; include \\r in old_string.");
+        return;
+    }
+
+    while (*start == ' ' || *start == '\t' || *start == '\n')
+        start++;
+    nl = strchr(start, '\n');
+    fl = nl ? (size_t)(nl - start) : strlen(start);
+    while (fl > 0 && (start[fl - 1] == ' ' || start[fl - 1] == '\t' || start[fl - 1] == '\r'))
+        fl--;
+    if (fl < 4 || fl >= sizeof(first) || !nl)
+        goto generic;
+    memcpy(first, start, fl);
+    first[fl] = '\0';
+    {
+        const char *hit = strstr(content, first);
+        if (hit) {
+            char hint[200];
+            snprintf(hint, sizeof(hint),
+                     " Its first line occurs at line %zu, but the following lines differ;"
+                     " re-read the file around that line.",
+                     line_of_offset(content, (size_t)(hit - content)));
+            append_suffix(out, out_cap, hint);
+            return;
+        }
+    }
+generic:
+    append_suffix(out, out_cap,
+                  " Re-read the file and copy the exact text, including whitespace and indentation.");
+}
+
+/* Append lines [from, to] of s, numbered, to out. */
+static void append_numbered_lines(const char *s, size_t from, size_t to,
+                                  char *out, size_t out_cap) {
+    size_t line = 1;
+    const char *p = s;
+    while (*p && line <= to) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        if (line >= from) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "\n%6zu  ", line);
+            append_suffix(out, out_cap, buf);
+            if (len > 300) {
+                char *tmp = nc_strdup_n(p, 300);
+                if (tmp) {
+                    append_suffix(out, out_cap, tmp);
+                    free(tmp);
+                }
+                append_suffix(out, out_cap, "...");
+            } else {
+                char *tmp = nc_strdup_n(p, len);
+                if (tmp) {
+                    append_suffix(out, out_cap, tmp);
+                    free(tmp);
+                }
+            }
+        }
+        if (!eol)
+            break;
+        p = eol + 1;
+        line++;
+    }
+}
+
+/* Write data to path atomically (temp file in the same directory, then
+ * rename), keeping the original file mode. */
+static bool write_file_atomic(const char *path, const char *data, size_t len, mode_t mode) {
+    char tmp[PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    int fd;
+    size_t off = 0;
+
+    if (slash)
+        snprintf(tmp, sizeof(tmp), "%.*s/.noclaw_edit_XXXXXX", (int)(slash - path), path);
+    else
+        nc_strlcpy(tmp, ".noclaw_edit_XXXXXX", sizeof(tmp));
+
+    fd = mkstemp(tmp);
+    if (fd < 0)
+        return false;
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            unlink(tmp);
+            return false;
+        }
+        off += (size_t)n;
+    }
+    if (fchmod(fd, mode & 07777) != 0 || close(fd) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+static bool file_edit_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
+    const nc_config *cfg = (const nc_config *)self->ctx;
+    char path[1024];
+    char real[PATH_MAX];
+    char *old_s = NULL, *new_s = NULL, *content = NULL, *updated = NULL;
+    bool replace_all = false;
+    bool ok = false;
+    size_t len = 0, old_len, new_len, first_off = 0, count;
+    struct stat st;
+    nc_arena a;
+
+    if (out_cap == 0)
+        return false;
+    out[0] = '\0';
+
+    nc_arena_init(&a, strlen(args_json) * 2 + 256);
+    {
+        nc_json *root = nc_json_parse(&a, args_json, strlen(args_json));
+        nc_json *pv = root ? nc_json_get(root, "path") : NULL;
+        nc_json *ov = root ? nc_json_get(root, "old_string") : NULL;
+        nc_json *nv = root ? nc_json_get(root, "new_string") : NULL;
+
+        if (!root) {
+            nc_strlcpy(out, "error: invalid JSON arguments", out_cap);
+            goto cleanup;
+        }
+        if (!pv || pv->type != NC_JSON_STRING || pv->string.len == 0) {
+            nc_strlcpy(out, "error: missing 'path' argument", out_cap);
+            goto cleanup;
+        }
+        if (!ov || ov->type != NC_JSON_STRING) {
+            nc_strlcpy(out, "error: missing 'old_string' argument", out_cap);
+            goto cleanup;
+        }
+        if (!nv || nv->type != NC_JSON_STRING) {
+            nc_strlcpy(out, "error: missing 'new_string' argument", out_cap);
+            goto cleanup;
+        }
+        if (pv->string.len >= sizeof(path)) {
+            nc_strlcpy(out, "error: 'path' argument too long", out_cap);
+            goto cleanup;
+        }
+        memcpy(path, pv->string.ptr, pv->string.len);
+        path[pv->string.len] = '\0';
+        old_s = nc_strdup_n(ov->string.ptr, ov->string.len);
+        new_s = nc_strdup_n(nv->string.ptr, nv->string.len);
+        replace_all = nc_json_bool(nc_json_get(root, "replace_all"), false);
+        if (!old_s || !new_s) {
+            nc_strlcpy(out, "error: out of memory", out_cap);
+            goto cleanup;
+        }
+    }
+
+    old_len = strlen(old_s);
+    new_len = strlen(new_s);
+    if (old_len == 0) {
+        nc_strlcpy(out, "error: 'old_string' must not be empty (use file_write to create files)", out_cap);
+        goto cleanup;
+    }
+    if (strcmp(old_s, new_s) == 0) {
+        nc_strlcpy(out, "error: 'old_string' and 'new_string' are identical; nothing to change", out_cap);
+        goto cleanup;
+    }
+
+    if (!resolve_existing_path(cfg, path, real, sizeof(real), out, out_cap))
+        goto cleanup;
+    if (stat(real, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(out, out_cap, "error: '%s' is not a regular file", path);
+        goto cleanup;
+    }
+    content = nc_read_file(real, &len);
+    if (!content) {
+        snprintf(out, out_cap, "error: cannot read '%s' (unreadable or larger than 10 MB)", path);
+        goto cleanup;
+    }
+    if (memchr(content, '\0', len)) {
+        snprintf(out, out_cap, "error: '%s' looks like a binary file; file_edit only edits text", path);
+        goto cleanup;
+    }
+
+    count = count_occurrences(content, old_s, old_len, &first_off);
+    if (count == 0) {
+        snprintf(out, out_cap, "error: old_string not found in '%s'.", path);
+        edit_not_found_hint(content, old_s, out, out_cap);
+        goto cleanup;
+    }
+    if (count > 1 && !replace_all) {
+        size_t shown = 0;
+        snprintf(out, out_cap,
+                 "error: old_string occurs %zu times in '%s' (lines", count, path);
+        for (const char *p = strstr(content, old_s); p && shown < 10;
+             p = strstr(p + old_len, old_s), shown++) {
+            char num[32];
+            snprintf(num, sizeof(num), "%s %zu", shown ? "," : "",
+                     line_of_offset(content, (size_t)(p - content)));
+            append_suffix(out, out_cap, num);
+        }
+        append_suffix(out, out_cap, count > 10 ? ", ...)." : ").");
+        append_suffix(out, out_cap,
+                      " Include more surrounding lines to make it unique, or set replace_all to true.");
+        goto cleanup;
+    }
+
+    {
+        size_t new_total = len - count * old_len + count * new_len;
+        char *w;
+        const char *r = content;
+
+        updated = (char *)malloc(new_total + 1);
+        if (!updated) {
+            nc_strlcpy(out, "error: out of memory", out_cap);
+            goto cleanup;
+        }
+        w = updated;
+        for (size_t i = 0; i < count; i++) {
+            const char *hit = strstr(r, old_s);
+            memcpy(w, r, (size_t)(hit - r));
+            w += hit - r;
+            memcpy(w, new_s, new_len);
+            w += new_len;
+            r = hit + old_len;
+        }
+        memcpy(w, r, len - (size_t)(r - content));
+        w += len - (size_t)(r - content);
+        *w = '\0';
+
+        if (!write_file_atomic(real, updated, new_total, st.st_mode)) {
+            snprintf(out, out_cap, "error: failed to write '%s': %s", path, strerror(errno));
+            goto cleanup;
+        }
+    }
+
+    {
+        size_t first_line = line_of_offset(content, first_off);
+        size_t new_lines = 1;
+        for (const char *p = new_s; *p; p++)
+            if (*p == '\n')
+                new_lines++;
+        snprintf(out, out_cap, "Edited %s: replaced %zu occurrence%s",
+                 path, count, count == 1 ? "" : "s");
+        if (count == 1) {
+            size_t from = first_line > 2 ? first_line - 2 : 1;
+            size_t to = first_line + new_lines + 1;
+            if (to > from + 30)
+                to = from + 30;
+            append_suffix(out, out_cap, ". Result:");
+            append_numbered_lines(updated, from, to, out, out_cap);
+        } else {
+            char at[64];
+            snprintf(at, sizeof(at), " (first at line %zu)", first_line);
+            append_suffix(out, out_cap, at);
+        }
+    }
+    tool_debug("file_edit", "%s: %zu replacement(s)", path, count);
+    ok = true;
+
+cleanup:
+    nc_arena_free(&a);
+    free(old_s);
+    free(new_s);
+    free(content);
+    free(updated);
+    return ok;
+}
+
+nc_tool nc_tool_file_edit(const nc_config *cfg) {
+    return (nc_tool){
+        .def = {
+            .name = "file_edit",
+            .description = "Edit an existing text file by replacing an exact string. old_string must match the file exactly (including whitespace and indentation) and be unique unless replace_all is true. Prefer this over file_write for changing existing files.",
+            .parameters_json =
+                "{\"type\":\"object\",\"properties\":{"
+                "\"path\":{\"type\":\"string\",\"description\":\"File to edit\"},"
+                "\"old_string\":{\"type\":\"string\",\"description\":\"Exact text to replace; include enough surrounding lines to be unique\"},"
+                "\"new_string\":{\"type\":\"string\",\"description\":\"Replacement text (empty string deletes old_string)\"},"
+                "\"replace_all\":{\"type\":\"boolean\",\"description\":\"Replace every occurrence instead of requiring a unique match (default false)\"}},"
+                "\"required\":[\"path\",\"old_string\",\"new_string\"]}",
+        },
+        .ctx = (void *)cfg,
+        .execute = file_edit_execute,
         .free = NULL,
     };
 }

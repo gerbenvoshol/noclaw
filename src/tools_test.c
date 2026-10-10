@@ -195,6 +195,115 @@ static void test_web_fetch_offline(char *out, size_t out_cap)
               "web_fetch_allow_private lifts the block");
 }
 
+static bool file_has(const char *path, const char *expect)
+{
+    size_t len = 0;
+    char *c = nc_read_file(path, &len);
+    bool ok = c && strcmp(c, expect) == 0;
+    if (!ok)
+        fprintf(stderr, "  %s: got [%s] expected [%s]\n", path, c ? c : "(null)", expect);
+    free(c);
+    return ok;
+}
+
+static void test_file_edit(char *out, size_t out_cap)
+{
+    char ws[] = "/tmp/noclaw_edit_XXXXXX";
+    char path[1024], cmd[1200];
+    nc_config cfg;
+    struct stat st;
+
+    mkdtemp_or_die(ws);
+    setup_cfg(&cfg, ws, true);
+    nc_tool fe = nc_tool_file_edit(&cfg);
+
+    snprintf(path, sizeof(path), "%s/a.c", ws);
+    {
+        const char *init = "int a = 1;\nint b = 2;\nint c = 3;\nint b2 = 2;\n";
+        nc_write_file(path, init, strlen(init));
+    }
+    chmod(path, 0640);
+
+    NC_ASSERT(fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"int b = 2;\",\"new_string\":\"int b = 20;\\nint bb = 21;\"}",
+                         out, out_cap), "file_edit replaces a unique string");
+    NC_ASSERT(file_has(path, "int a = 1;\nint b = 20;\nint bb = 21;\nint c = 3;\nint b2 = 2;\n"),
+              "file_edit writes the new content");
+    NC_ASSERT(strstr(out, "replaced 1 occurrence") && strstr(out, "     2  int b = 20;") &&
+              strstr(out, "     3  int bb = 21;"), "file_edit shows numbered result lines");
+    NC_ASSERT(stat(path, &st) == 0 && (st.st_mode & 0777) == 0640, "file_edit preserves file mode");
+
+    NC_ASSERT(fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\" = 2;\",\"new_string\":\" = 9;\"}",
+                         out, out_cap), "file_edit matches a substring once the other copy changed");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"int \",\"new_string\":\"long \"}",
+                          out, out_cap), "file_edit refuses ambiguous match");
+    NC_ASSERT(strstr(out, "occurs 5 times") && strstr(out, "lines 1, 2, 3, 4, 5") &&
+              strstr(out, "replace_all"), "file_edit lists ambiguous match lines");
+
+    NC_ASSERT(fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"int \",\"new_string\":\"long \",\"replace_all\":true}",
+                         out, out_cap) && strstr(out, "replaced 5 occurrences"),
+              "file_edit replace_all replaces every match");
+    NC_ASSERT(file_has(path, "long a = 1;\nlong b = 20;\nlong bb = 21;\nlong c = 3;\nlong b2 = 9;\n"),
+              "file_edit replace_all content");
+
+    NC_ASSERT(fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"long bb = 21;\\n\",\"new_string\":\"\"}",
+                         out, out_cap), "file_edit deletes with empty new_string");
+    NC_ASSERT(file_has(path, "long a = 1;\nlong b = 20;\nlong c = 3;\nlong b2 = 9;\n"),
+              "file_edit deletion content");
+
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"long c = 3;\\nlong d\",\"new_string\":\"x\"}",
+                          out, out_cap) && strstr(out, "not found") && strstr(out, "first line occurs at line 3"),
+              "file_edit not-found hint points at the first line");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"zzz\",\"new_string\":\"x\"}",
+                          out, out_cap) && strstr(out, "Re-read the file"),
+              "file_edit generic not-found hint");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"long\",\"new_string\":\"long\"}",
+                          out, out_cap) && strstr(out, "identical"), "file_edit rejects no-op edit");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"\",\"new_string\":\"x\"}",
+                          out, out_cap) && strstr(out, "must not be empty"), "file_edit rejects empty old_string");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"a.c\",\"old_string\":\"x\"}", out, out_cap) &&
+              strstr(out, "new_string"), "file_edit requires new_string");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"missing.c\",\"old_string\":\"x\",\"new_string\":\"y\"}",
+                          out, out_cap) && strstr(out, "cannot resolve"), "file_edit reports missing file");
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"../etc/passwd\",\"old_string\":\"x\",\"new_string\":\"y\"}",
+                          out, out_cap) && strstr(out, "traversal"), "file_edit blocks traversal");
+
+    snprintf(path, sizeof(path), "%s/crlf.txt", ws);
+    nc_write_file(path, "one\r\ntwo\r\n", 10);
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"crlf.txt\",\"old_string\":\"one\\ntwo\",\"new_string\":\"x\"}",
+                          out, out_cap) && strstr(out, "CRLF"), "file_edit explains CRLF mismatch");
+
+    snprintf(path, sizeof(path), "%s/bin.dat", ws);
+    nc_write_file(path, "ab\0cd", 5);
+    NC_ASSERT(!fe.execute(&fe, "{\"path\":\"bin.dat\",\"old_string\":\"ab\",\"new_string\":\"x\"}",
+                          out, out_cap) && strstr(out, "binary"), "file_edit refuses binary files");
+
+    {
+        char outside[] = "/tmp/noclaw_edit_out_XXXXXX";
+        char target[1024], link[1024];
+        mkdtemp_or_die(outside);
+        snprintf(target, sizeof(target), "%s/secret.txt", outside);
+        nc_write_file(target, "secret", 6);
+        snprintf(link, sizeof(link), "%s/link.txt", ws);
+        NC_ASSERT(symlink(target, link) == 0, "create symlink for escape test");
+        NC_ASSERT(!fe.execute(&fe, "{\"path\":\"link.txt\",\"old_string\":\"secret\",\"new_string\":\"pwned\"}",
+                              out, out_cap) && strstr(out, "escapes workspace"),
+                  "file_edit blocks symlink escape");
+        NC_ASSERT(file_has(target, "secret"), "file outside workspace untouched");
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", outside);
+        NC_ASSERT(system(cmd) == 0, "clean up outside dir");
+    }
+
+    snprintf(cmd, sizeof(cmd), "ls -A '%s' | grep -c noclaw_edit_ || true", ws);
+    {
+        FILE *f = popen(cmd, "r");
+        char buf[16] = "";
+        if (f) { if (!fgets(buf, sizeof(buf), f)) buf[0] = '\0'; pclose(f); }
+        NC_ASSERT(atoi(buf) == 0, "file_edit leaves no temp files");
+    }
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", ws);
+    NC_ASSERT(system(cmd) == 0, "clean up file_edit test dir");
+}
+
 void nc_test_tools(void)
 {
     char tmpl[] = "/tmp/noclaw_tools_XXXXXX";
@@ -390,6 +499,7 @@ void nc_test_tools(void)
               strstr(out, "err") != NULL,
         "shell captures stderr");
 
+    test_file_edit(out, sizeof(out));
     test_external_tools(out, sizeof(out));
     test_web_fetch_offline(out, sizeof(out));
 

@@ -312,6 +312,7 @@ nc_tool nc_tool_apply_patch(const nc_config *cfg);
 nc_tool nc_tool_tool_debug(const nc_config *cfg);
 nc_tool nc_tool_file_read(const nc_config *cfg);
 nc_tool nc_tool_file_write(const nc_config *cfg);
+nc_tool nc_tool_file_edit(const nc_config *cfg);
 nc_tool nc_tool_web_fetch(const nc_config *cfg);
 nc_tool nc_tool_memory_store(void *mem_ctx);
 nc_tool nc_tool_memory_recall(void *mem_ctx);
