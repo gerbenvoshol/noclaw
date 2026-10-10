@@ -135,6 +135,30 @@ static void agent_push_msg(nc_agent *agent, const char *role, const char *conten
 
 /* ── Compact message history, resetting the arena ────────────── */
 
+/* A tool-call round is one assistant message followed by at most
+ * NC_MAX_TOOL_CALLS tool results, so a window of NC_MAX_MESSAGES/2 messages
+ * always contains at least one non-tool message to start from. */
+_Static_assert(NC_MAX_TOOL_CALLS < NC_MAX_MESSAGES / 2,
+               "compaction window must be larger than one tool-call round");
+
+static const char compaction_note[] =
+    "[Earlier conversation was truncated to fit the context window.]";
+
+static bool msg_role_is(const nc_message *m, const char *role) {
+    return m->role && strcmp(m->role, role) == 0;
+}
+
+/* Pick the first message to keep, at or after `start`. Kept history must not
+ * begin with a tool result whose assistant tool_calls message was dropped —
+ * providers reject such history — so skip forward past tool messages. */
+static int compaction_start(const nc_agent *agent, int start) {
+    for (int i = start; i < agent->message_count; i++) {
+        if (!msg_role_is(&agent->messages[i], "tool"))
+            return i;
+    }
+    return agent->message_count;
+}
+
 /* Scratch copy of a message for arena-safe compaction. */
 typedef struct {
     char  role[32];
@@ -145,85 +169,74 @@ typedef struct {
     int   tool_call_count;
 } nc_msg_scratch;
 
-static void agent_compact_messages(nc_agent *agent) {
-    /* keep = NC_MAX_MESSAGES/2 is always >= 1 (NC_MAX_MESSAGES is a positive compile-time constant),
-     * so (keep + 1) is always positive and safe to cast to size_t. */
-    int keep  = NC_MAX_MESSAGES / 2;
-    int total = agent->message_count;
-    int start = total - keep;
-    if (start < 1) start = 1; /* never drop system message */
+static void scratch_save(nc_msg_scratch *s, const nc_message *m, const char *default_role) {
+    nc_strlcpy(s->role, m->role ? m->role : default_role, sizeof(s->role));
+    if (m->content && !(s->content = strdup(m->content)))
+        nc_log(NC_LOG_WARN, "Session compaction: strdup failed for message content");
+    if (m->tool_call_id && !(s->tool_call_id = strdup(m->tool_call_id)))
+        nc_log(NC_LOG_WARN, "Session compaction: strdup failed for tool_call_id");
+    if (m->raw_json && !(s->raw_json = strdup(m->raw_json)))
+        nc_log(NC_LOG_WARN, "Session compaction: strdup failed for raw_json");
+    if (m->tool_calls && m->tool_call_count > 0) {
+        s->tool_calls = (nc_tool_call *)malloc(
+            (size_t)m->tool_call_count * sizeof(nc_tool_call));
+        if (s->tool_calls) {
+            memcpy(s->tool_calls, m->tool_calls,
+                   (size_t)m->tool_call_count * sizeof(nc_tool_call));
+            s->tool_call_count = m->tool_call_count;
+        } else {
+            nc_log(NC_LOG_WARN, "Session compaction: malloc failed for tool_calls");
+        }
+    }
+}
 
-    /* Allocate scratch storage on the heap for messages we're keeping.
-     * scratch[0] = system message, scratch[1..keep] = the `keep` kept messages. */
+static void agent_compact_messages(nc_agent *agent) {
+    int total = agent->message_count;
+    int start = total - NC_MAX_MESSAGES / 2;
+    if (start < 1) start = 1; /* never drop system message */
+    start = compaction_start(agent, start);
+
+    int keep = total - start;
+    /* Most providers (Anthropic in particular) require the first non-system
+     * message to come from the user; insert a note when the cut lands on an
+     * assistant message. */
+    bool add_note = keep > 0 && !msg_role_is(&agent->messages[start], "user");
+    int note_slots = add_note ? 1 : 0;
+
+    /* scratch[0] = system message, scratch[1..keep] = the kept messages. */
     nc_msg_scratch *scratch = (nc_msg_scratch *)calloc(
-        (size_t)(keep + 1), sizeof(nc_msg_scratch));
+        (size_t)keep + 1, sizeof(nc_msg_scratch));
     if (!scratch) {
         /* Fallback: memmove without arena reset (no crash, but arena leaks) */
-        memmove(&agent->messages[1], &agent->messages[start],
+        memmove(&agent->messages[1 + note_slots], &agent->messages[start],
                 (size_t)keep * sizeof(nc_message));
-        agent->message_count = 1 + keep;
+        if (add_note) {
+            agent->messages[1] = (nc_message){
+                .role = nc_arena_dup(&agent->arena, "user", 4),
+                .content = nc_arena_dup(&agent->arena, compaction_note,
+                                        sizeof(compaction_note) - 1),
+            };
+        }
+        agent->message_count = 1 + note_slots + keep;
         nc_log(NC_LOG_WARN,
                "Session compaction: alloc failed, arena not reset (%d messages kept)",
                keep);
         return;
     }
 
-    /* Save system message (index 0).  If role is somehow NULL we fall back to "system"
-     * and log a warning; the fallback is safe because nc_strlcpy handles it. */
     if (agent->messages[0].role == NULL)
         nc_log(NC_LOG_WARN, "Session compaction: system message has NULL role");
-    nc_strlcpy(scratch[0].role,
-               agent->messages[0].role ? agent->messages[0].role : "system",
-               sizeof(scratch[0].role));
-    if (agent->messages[0].content) {
-        scratch[0].content = strdup(agent->messages[0].content);
-        if (!scratch[0].content)
-            nc_log(NC_LOG_WARN, "Session compaction: strdup failed for system content");
-    }
-    /* system message has no tool_call_id / raw_json / tool_calls */
-
-    /* Save messages at indices [start .. start+keep-1] into scratch[1..keep] */
-    for (int i = 0; i < keep; i++) {
-        const nc_message *m = &agent->messages[start + i];
-        nc_strlcpy(scratch[i + 1].role,
-                   m->role ? m->role : "user",
-                   sizeof(scratch[i + 1].role));
-        if (m->content) {
-            scratch[i + 1].content = strdup(m->content);
-            if (!scratch[i + 1].content)
-                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for message content (msg %d)", i);
-        }
-        if (m->tool_call_id) {
-            scratch[i + 1].tool_call_id = strdup(m->tool_call_id);
-            if (!scratch[i + 1].tool_call_id)
-                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for tool_call_id (msg %d)", i);
-        }
-        if (m->raw_json) {
-            scratch[i + 1].raw_json = strdup(m->raw_json);
-            if (!scratch[i + 1].raw_json)
-                nc_log(NC_LOG_WARN, "Session compaction: strdup failed for raw_json (msg %d)", i);
-        }
-        scratch[i + 1].tool_call_count = m->tool_call_count;
-        if (m->tool_calls && m->tool_call_count > 0) {
-            scratch[i + 1].tool_calls = (nc_tool_call *)malloc(
-                (size_t)m->tool_call_count * sizeof(nc_tool_call));
-            if (scratch[i + 1].tool_calls) {
-                memcpy(scratch[i + 1].tool_calls, m->tool_calls,
-                       (size_t)m->tool_call_count * sizeof(nc_tool_call));
-            } else {
-                nc_log(NC_LOG_WARN, "Session compaction: malloc failed for tool_calls (msg %d)", i);
-                scratch[i + 1].tool_call_count = 0;
-            }
-        }
-    }
+    scratch_save(&scratch[0], &agent->messages[0], "system");
+    for (int i = 0; i < keep; i++)
+        scratch_save(&scratch[i + 1], &agent->messages[start + i], "user");
 
     /* Reset the arena — all arena-allocated string pointers are now invalid */
     nc_arena_reset(&agent->arena);
     agent->message_count = 0;
 
-    /* Re-push all keep+1 saved messages (system + kept) into the fresh arena.
-     * scratch has exactly keep+1 elements: indices 0..keep inclusive. */
     for (int i = 0; i <= keep; i++) {
+        if (i == 1 && add_note)
+            agent_push_msg(agent, "user", compaction_note, NULL, NULL, 0, NULL);
         agent_push_msg(agent,
                        scratch[i].role,
                        scratch[i].content,
@@ -239,10 +252,9 @@ static void agent_compact_messages(nc_agent *agent) {
     free(scratch);
 
     nc_log(NC_LOG_INFO,
-           "Session compacted: kept %d/%d messages, arena reset",
-           keep, total);
+           "Session compacted: kept %d/%d messages%s, arena reset",
+           keep, total, add_note ? " (+truncation note)" : "");
 }
-
 
 
 static void agent_push_msg(nc_agent *agent, const char *role, const char *content,
@@ -502,3 +514,82 @@ void nc_agent_free(nc_agent *agent) {
     nc_arena_free(&agent->arena);
     agent->message_count = 0;
 }
+
+/* ── Tests ───────────────────────────────────────────────────── */
+
+#ifdef NC_TEST
+
+/* Kept history must start with a user message, and every tool result must
+ * follow (through other tool results) an assistant message with tool_calls. */
+static bool history_is_valid(const nc_agent *agent) {
+    if (agent->message_count < 1 || !msg_role_is(&agent->messages[0], "system"))
+        return false;
+    if (agent->message_count > 1 && !msg_role_is(&agent->messages[1], "user"))
+        return false;
+    for (int i = 1; i < agent->message_count; i++) {
+        if (!msg_role_is(&agent->messages[i], "tool"))
+            continue;
+        int j = i - 1;
+        while (j > 0 && msg_role_is(&agent->messages[j], "tool")) j--;
+        if (!msg_role_is(&agent->messages[j], "assistant") ||
+            agent->messages[j].tool_call_count == 0)
+            return false;
+    }
+    return true;
+}
+
+static void test_compaction_rounds(int calls_per_round, int rounds) {
+    static nc_config cfg;
+    static nc_agent agent;
+    static nc_tool_call calls[NC_MAX_TOOL_CALLS];
+    bool valid = true;
+    int compactions = 0;
+
+    memset(&cfg, 0, sizeof(cfg));
+    nc_agent_init(&agent, &cfg, NULL, NULL, 0, NULL);
+    for (int i = 0; i < calls_per_round; i++) {
+        memset(&calls[i], 0, sizeof(calls[i]));
+        snprintf(calls[i].id, sizeof(calls[i].id), "call_%d", i);
+        nc_strlcpy(calls[i].name, "shell", sizeof(calls[i].name));
+    }
+
+    agent_push_msg(&agent, "user", "start a long task", NULL, NULL, 0, NULL);
+    for (int r = 0; r < rounds && valid; r++) {
+        int before = agent.message_count;
+        agent_push_msg(&agent, "assistant", NULL, NULL, calls, calls_per_round, NULL);
+        if (agent.message_count < before) compactions++;
+        valid = history_is_valid(&agent);
+        for (int i = 0; i < calls_per_round && valid; i++) {
+            before = agent.message_count;
+            agent_push_msg(&agent, "tool", "ok", calls[i].id, NULL, 0, NULL);
+            if (agent.message_count < before) compactions++;
+            valid = history_is_valid(&agent);
+        }
+    }
+
+    NC_ASSERT(compactions > 0, "compaction test triggers compaction");
+    NC_ASSERT(valid, "compacted history never starts with orphaned tool results");
+    NC_ASSERT(agent.message_count <= NC_MAX_MESSAGES, "compacted history fits");
+    nc_agent_free(&agent);
+}
+
+void nc_test_agent(void) {
+    test_compaction_rounds(1, 400);
+    test_compaction_rounds(3, 200);
+    test_compaction_rounds(7, 100);
+    test_compaction_rounds(NC_MAX_TOOL_CALLS, 20);
+
+    /* Plain chat: whichever role the cut lands on, history stays valid. */
+    {
+        static nc_config cfg;
+        static nc_agent agent;
+        memset(&cfg, 0, sizeof(cfg));
+        nc_agent_init(&agent, &cfg, NULL, NULL, 0, NULL);
+        for (int i = 0; i < NC_MAX_MESSAGES + 10; i++)
+            agent_push_msg(&agent, (i % 2) ? "assistant" : "user", "hi", NULL, NULL, 0, NULL);
+        NC_ASSERT(history_is_valid(&agent), "plain chat history stays valid after compaction");
+        nc_agent_free(&agent);
+    }
+}
+
+#endif

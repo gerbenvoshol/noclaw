@@ -29,6 +29,7 @@ int main(void) {
     nc_test_memory();
     nc_test_http();
     nc_test_tools();
+    nc_test_agent();
 
     printf("\n═════════════════\n");
     printf("Results: %d passed, %d failed\n", nc_test_pass, nc_test_fail);

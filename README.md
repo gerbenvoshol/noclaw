@@ -203,7 +203,8 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
     "level": "supervised",
     "workspace_only": true,
     "max_actions_per_hour": 20,
-    "max_iterations": 50
+    "max_iterations": 50,
+    "shell_timeout_seconds": 60
   },
   "heartbeat": {
     "enabled": false,
@@ -238,6 +239,8 @@ Config: `~/.noclaw/config.json` (created by `onboard`)
 
 **`default_temperature`** is optional. When omitted, the provider uses its own default. Valid range is `0.0`–`2.0`. Can also be set via `NOCLAW_TEMPERATURE`.
 
+**`autonomy.shell_timeout_seconds`** (default `60`) limits how long a single `shell` tool call may run. On timeout the command's whole process group is killed and the model gets the output so far plus a timeout notice. Shell commands run with stdin set to `/dev/null`. Can also be set via `NOCLAW_SHELL_TIMEOUT`.
+
 **`max_tokens`** controls the maximum number of output tokens per request. noclaw maps this to the correct API parameter based on the endpoint: requests to `https://api.openai.com` (or any path under it, such as `/v1`) use `max_completion_tokens` (required by newer OpenAI models like o1/o3/o4); all other endpoints (OpenRouter, Anthropic, Gemini, Ollama, etc.) use `max_tokens`. When you set `provider: openai`, the API URL defaults to `https://api.openai.com/v1` automatically. Can also be set via `NOCLAW_MAX_TOKENS`.
 
 > **Note on providers:** Use `provider: openrouter` for OpenRouter (routes to any model), or `provider: openai` to talk to the OpenAI API directly. Direct OpenAI is required for models like o1/o3/o4 that only accept `max_completion_tokens`.
@@ -253,7 +256,7 @@ For local models, omit `api_key` and set `api_url` instead:
 }
 ```
 
-Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_HTTP_TIMEOUT`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
+Environment variable overrides: `NOCLAW_API_KEY`, `NOCLAW_PROVIDER`, `NOCLAW_MODEL`, `NOCLAW_TEMPERATURE`, `NOCLAW_MAX_TOKENS`, `NOCLAW_HTTP_TIMEOUT`, `NOCLAW_SHELL_TIMEOUT`, `NOCLAW_GATEWAY_PORT`, `NOCLAW_GATEWAY_HOST`, `NOCLAW_WORKSPACE`, `NOCLAW_INSTRUCTIONS_FILE`, `NOCLAW_BASE_URL`. For Gemini, set `NOCLAW_PROVIDER=gemini` and optionally `NOCLAW_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`.
 
 ## Gateway API
 

@@ -12,6 +12,9 @@
 #include <sys/wait.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <time.h>
 
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -256,6 +259,146 @@ static bool shell_quote_single(char *dst, size_t dst_cap, const char *src)
     return true;
 }
 
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Run `/bin/sh -c shell_cmd` in its own process group with stdin from
+ * /dev/null, capturing stdout+stderr into `out`. Output beyond out_cap is
+ * drained and discarded so the child never blocks on a full pipe. If the
+ * command is still running after timeout_s seconds, the whole process group
+ * (pipelines, background jobs) is killed. */
+static bool run_shell_command(const char *shell_cmd, int timeout_s,
+                              char *out, size_t out_cap, int *status_out,
+                              bool *timed_out, bool *truncated)
+{
+    int pipefd[2];
+    pid_t pid;
+    size_t total = 0;
+    /* Leave room after captured output for truncation/exit/timeout notes. */
+    size_t capture_cap = out_cap > 1024 ? out_cap - 256 : out_cap;
+    long long deadline = monotonic_ms() + (long long)timeout_s * 1000;
+
+    *timed_out = false;
+    *truncated = false;
+    out[0] = '\0';
+
+    if (pipe(pipefd) != 0) {
+        snprintf(out, out_cap, "error: failed to create pipe: %s", strerror(errno));
+        return false;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        int saved = errno;
+        close(pipefd[0]);
+        close(pipefd[1]);
+        snprintf(out, out_cap, "error: failed to execute command: %s", strerror(saved));
+        return false;
+    }
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDONLY);
+        setpgid(0, 0);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", shell_cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Also set in the parent so kill(-pid) works even if the child has not
+     * run setpgid yet. */
+    setpgid(pid, pid);
+    close(pipefd[1]);
+
+    for (;;) {
+        long long remaining = deadline - monotonic_ms();
+        struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
+        char buf[4096];
+        ssize_t n;
+        int pr;
+
+        if (remaining <= 0) {
+            *timed_out = true;
+            break;
+        }
+        pr = poll(&pfd, 1, remaining > INT_MAX ? INT_MAX : (int)remaining);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (pr == 0)
+            continue; /* deadline re-checked at top of loop */
+
+        n = read(pipefd[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break; /* EOF: every writer has closed the pipe */
+
+        if (total < capture_cap - 1) {
+            size_t cp = (size_t)n;
+            if (cp > capture_cap - 1 - total)
+                cp = capture_cap - 1 - total;
+            memcpy(out + total, buf, cp);
+            total += cp;
+            if (cp < (size_t)n)
+                *truncated = true;
+        } else {
+            *truncated = true;
+        }
+    }
+    close(pipefd[0]);
+    out[total] = '\0';
+
+    if (*timed_out)
+        kill(-pid, SIGKILL);
+
+    /* The shell may outlive its stdout (e.g. `exec >&-; sleep 100`), so keep
+     * honouring the deadline while waiting for it to exit. */
+    for (;;) {
+        pid_t w = waitpid(pid, status_out, *timed_out ? 0 : WNOHANG);
+        if (w == pid)
+            break;
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            snprintf(out, out_cap, "error: failed to wait for shell process: %s", strerror(errno));
+            kill(-pid, SIGKILL);
+            return false;
+        }
+        if (*timed_out) {
+            continue;
+        }
+        if (monotonic_ms() >= deadline) {
+            *timed_out = true;
+            kill(-pid, SIGKILL);
+            continue;
+        }
+        {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    /* Background jobs that detached from the pipe (e.g. `cmd > log &`) are
+     * left running on success; only a timeout kills the group. */
+    return true;
+}
+
 static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_t out_cap) {
     const nc_config *cfg = (const nc_config *)self->ctx;
     char *command = NULL;
@@ -263,7 +406,7 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
     char block_reason[128];
     size_t full_len = 0;
     nc_extract_status est;
-    FILE *fp = NULL;
+    int status = 0;
     bool ok = false;
 
     if (out_cap == 0)
@@ -353,35 +496,25 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
         }
     }
 
-    fp = popen(shell_cmd, "r");
-    if (!fp) {
-        snprintf(out, out_cap,
-                 "error: failed to execute command: %s",
-                 strerror(errno));
-        goto cleanup;
-    }
+    {
+        int timeout_s = cfg->shell_timeout_seconds > 0 ? cfg->shell_timeout_seconds : 60;
+        bool timed_out, truncated;
 
-    size_t total = 0;
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), fp) && total < out_cap - 1) {
-        size_t n = strlen(buf);
-        if (total + n >= out_cap - 1)
-            n = out_cap - 1 - total;
-        memcpy(out + total, buf, n);
-        total += n;
-    }
-    out[total] = '\0';
-    if (!feof(fp))
-        append_suffix(out, out_cap, "\n[output truncated]");
+        if (!run_shell_command(shell_cmd, timeout_s, out, out_cap,
+                               &status, &timed_out, &truncated))
+            goto cleanup;
 
-    int status = pclose(fp);
-    fp = NULL;
+        if (truncated)
+            append_suffix(out, out_cap, "\n[output truncated]");
 
-    if (status == -1) {
-        snprintf(out, out_cap,
-                 "error: failed to close shell process: %s",
-                 strerror(errno));
-        goto cleanup;
+        if (timed_out) {
+            char suffix[96];
+            snprintf(suffix, sizeof(suffix),
+                     "\n[timed out after %d seconds; process killed]", timeout_s);
+            append_suffix(out, out_cap, suffix);
+            tool_debug("shell", "command timed out after %d seconds", timeout_s);
+            goto cleanup;
+        }
     }
 
     if (!WIFEXITED(status)) {
@@ -409,8 +542,6 @@ static bool shell_execute(nc_tool *self, const char *args_json, char *out, size_
     ok = true;
 
 cleanup:
-    if (fp)
-        pclose(fp);
     free(shell_cmd);
     free(command);
     return ok;

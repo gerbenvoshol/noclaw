@@ -175,6 +175,7 @@ typedef struct nc_config {
     bool workspace_only;
     int  max_actions_per_hour;
     int  max_iterations;
+    int  shell_timeout_seconds;
 
     /* Heartbeat */
     bool heartbeat_enabled;
@@ -436,6 +437,7 @@ void nc_test_jwriter(void);
 void nc_test_memory(void);
 void nc_test_http(void);
 void nc_test_tools(void);
+void nc_test_agent(void);
 #endif
 
 #endif /* NC_H */

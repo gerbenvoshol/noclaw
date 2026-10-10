@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static void mkdtemp_or_die(char *tmpl)
 {
@@ -184,6 +185,39 @@ void nc_test_tools(void)
         free(json);
         free(patch);
     }
+
+    {
+        time_t t0 = time(NULL);
+        cfg.shell_timeout_seconds = 1;
+        NC_ASSERT(!sh.execute(&sh, "{\"command\":\"echo started; sleep 30\"}", out, sizeof(out)),
+            "shell fails on timeout");
+        NC_ASSERT(strstr(out, "started") != NULL,
+            "shell keeps output produced before timeout");
+        NC_ASSERT(strstr(out, "timed out after 1 seconds") != NULL,
+            "shell reports timeout");
+        NC_ASSERT(time(NULL) - t0 < 5, "shell timeout kills the command promptly");
+
+        t0 = time(NULL);
+        NC_ASSERT(!sh.execute(&sh, "{\"command\":\"sleep 30 | cat\"}", out, sizeof(out)),
+            "shell times out on pipelines");
+        NC_ASSERT(time(NULL) - t0 < 5, "shell timeout kills the whole pipeline");
+        cfg.shell_timeout_seconds = 0;
+    }
+
+    NC_ASSERT(sh.execute(&sh, "{\"command\":\"cat; echo done\"}", out, sizeof(out)),
+        "shell commands get empty stdin instead of blocking");
+    NC_ASSERT(strstr(out, "done") != NULL, "shell stdin test output");
+
+    NC_ASSERT(sh.execute(&sh,
+        "{\"command\":\"head -c 1000000 /dev/zero | tr '\\\\0' a\"}",
+        out, sizeof(out)),
+        "shell handles output larger than the buffer");
+    NC_ASSERT(strstr(out, "[output truncated]") != NULL,
+        "shell marks oversized output as truncated");
+
+    NC_ASSERT(sh.execute(&sh, "{\"command\":\"echo err >&2\"}", out, sizeof(out)) &&
+              strstr(out, "err") != NULL,
+        "shell captures stderr");
 
     unlink("/tmp/escape.txt");
 }

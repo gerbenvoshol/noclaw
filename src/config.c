@@ -43,6 +43,7 @@ void nc_config_defaults(nc_config *cfg) {
     cfg->workspace_only = true;
     cfg->max_actions_per_hour = 20;
     cfg->max_iterations = 50;
+    cfg->shell_timeout_seconds = 60;
 
     /* Heartbeat */
     cfg->heartbeat_enabled = false;
@@ -150,6 +151,8 @@ bool nc_config_load(nc_config *cfg) {
             cfg->max_actions_per_hour = (int)nc_json_num(v, 20);
         if ((v = nc_json_get(aut, "max_iterations")))
             cfg->max_iterations = (int)nc_json_num(v, 50);
+        if ((v = nc_json_get(aut, "shell_timeout_seconds")))
+            cfg->shell_timeout_seconds = (int)nc_json_num(v, 60);
     }
 
     /* Heartbeat section */
@@ -289,11 +292,13 @@ bool nc_config_save(const nc_config *cfg) {
         char tmp[256];
         snprintf(tmp, sizeof(tmp),
             "\n    \"level\": \"%s\",\n    \"workspace_only\": %s,\n"
-            "    \"max_actions_per_hour\": %d,\n    \"max_iterations\": %d\n  }",
+            "    \"max_actions_per_hour\": %d,\n    \"max_iterations\": %d,\n"
+            "    \"shell_timeout_seconds\": %d\n  }",
             cfg->autonomy_level,
             cfg->workspace_only ? "true" : "false",
             cfg->max_actions_per_hour,
-            cfg->max_iterations);
+            cfg->max_iterations,
+            cfg->shell_timeout_seconds);
         size_t tl = strlen(tmp);
         if (w.len + tl < w.cap) { memcpy(w.buf + w.len, tmp, tl); w.len += tl; }
     }
@@ -434,6 +439,10 @@ void nc_config_apply_env(nc_config *cfg) {
         long t = strtol(v, NULL, 10);
         if (t >= 1 && t <= 3600) cfg->http_timeout_seconds = (int)t;
     }
+    if ((v = getenv("NOCLAW_SHELL_TIMEOUT"))) {
+        long t = strtol(v, NULL, 10);
+        if (t >= 1 && t <= 86400) cfg->shell_timeout_seconds = (int)t;
+    }
     if ((v = getenv("NOCLAW_GATEWAY_PORT"))) {
         long p = strtol(v, NULL, 10);
         if (p > 0 && p <= 65535) cfg->gateway_port = (uint16_t)p;
@@ -478,6 +487,7 @@ void nc_test_config(void) {
     NC_ASSERT(cfg.gateway_allow_public_bind == false, "config default no public bind");
     NC_ASSERT(cfg.workspace_only == true, "config default workspace_only");
     NC_ASSERT(cfg.max_iterations == 50, "config default max_iterations");
+    NC_ASSERT(cfg.shell_timeout_seconds == 60, "config default shell timeout");
     NC_ASSERT(cfg.secrets_encrypt == true, "config default secrets encrypt");
     NC_ASSERT(strcmp(cfg.memory_backend, "flat") == 0, "config default memory backend");
     NC_ASSERT(strcmp(cfg.runtime_kind, "native") == 0, "config default runtime");
