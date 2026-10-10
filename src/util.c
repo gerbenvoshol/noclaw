@@ -100,6 +100,47 @@ char *nc_format(const char *fmt, ...) {
     return buf;
 }
 
+/* Return the length of one valid UTF-8 sequence, or zero if malformed. */
+size_t nc_utf8_sequence_len(const char *s, size_t len) {
+    if (!s || len == 0) return 0;
+
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char b0 = p[0];
+    if (b0 <= 0x7f) return 1;
+
+    if (b0 >= 0xc2 && b0 <= 0xdf) {
+        return len >= 2 && p[1] >= 0x80 && p[1] <= 0xbf ? 2 : 0;
+    }
+
+    if (b0 >= 0xe0 && b0 <= 0xef) {
+        if (len < 3 || p[2] < 0x80 || p[2] > 0xbf) return 0;
+        if (b0 == 0xe0) return p[1] >= 0xa0 && p[1] <= 0xbf ? 3 : 0;
+        if (b0 == 0xed) return p[1] >= 0x80 && p[1] <= 0x9f ? 3 : 0;
+        return p[1] >= 0x80 && p[1] <= 0xbf ? 3 : 0;
+    }
+
+    if (b0 >= 0xf0 && b0 <= 0xf4) {
+        if (len < 4 || p[2] < 0x80 || p[2] > 0xbf ||
+            p[3] < 0x80 || p[3] > 0xbf)
+            return 0;
+        if (b0 == 0xf0) return p[1] >= 0x90 && p[1] <= 0xbf ? 4 : 0;
+        if (b0 == 0xf4) return p[1] >= 0x80 && p[1] <= 0x8f ? 4 : 0;
+        return p[1] >= 0x80 && p[1] <= 0xbf ? 4 : 0;
+    }
+
+    return 0;
+}
+
+size_t nc_utf8_safe_prefix(const char *s, size_t len, size_t max_bytes) {
+    size_t pos = 0;
+    while (pos < len && pos < max_bytes) {
+        size_t n = nc_utf8_sequence_len(s + pos, len - pos);
+        if (n == 0 || n > max_bytes - pos) break;
+        pos += n;
+    }
+    return pos;
+}
+
 /* ── Home directory ───────────────────────────────────────────── */
 
 const char *nc_home_dir(void) {

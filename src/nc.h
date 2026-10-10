@@ -442,6 +442,8 @@ void nc_test_memory(void);
 void nc_test_http(void);
 void nc_test_tools(void);
 void nc_test_agent(void);
+void nc_test_tools_utf8(void);
+void nc_test_provider(void);
 #endif
 
 #endif /* NC_H */

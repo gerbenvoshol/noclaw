@@ -1778,16 +1778,16 @@ nc_tool nc_tool_memory_recall(void *mem_ctx) {
 }
 
 #ifdef NC_TEST
-void nc_test_tools(void) {
+void nc_test_tools_utf8(void) {
     const char *json = "{\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x91\x8b\"}";
     char full[16];
     char truncated[5];
 
-    NC_ASSERT(extract_json_string(json, "content", full, sizeof(full)),
+    NC_ASSERT(extract_json_string2(json, "content", full, sizeof(full), NULL) == NC_EXTRACT_OK,
               "tool args extract UTF-8");
     NC_ASSERT(strcmp(full, "\xe4\xbd\xa0\xe5\xa5\xbd\xf0\x9f\x91\x8b") == 0,
               "tool args preserve UTF-8");
-    NC_ASSERT(extract_json_string(json, "content", truncated, sizeof(truncated)),
+    NC_ASSERT(extract_json_string2(json, "content", truncated, sizeof(truncated), NULL) == NC_EXTRACT_TRUNCATED,
               "tool args truncate UTF-8");
     NC_ASSERT(strcmp(truncated, "\xe4\xbd\xa0") == 0,
               "tool args truncate at UTF-8 boundary");

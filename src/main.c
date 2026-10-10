@@ -30,6 +30,8 @@ int main(void) {
     nc_test_http();
     nc_test_tools();
     nc_test_agent();
+    nc_test_tools_utf8();
+    nc_test_provider();
 
     printf("\n═════════════════\n");
     printf("Results: %d passed, %d failed\n", nc_test_pass, nc_test_fail);

@@ -33,6 +33,37 @@ static bool reasoning_is_none(const char *s) {
     return !s || !s[0] || strcmp(s, "none") == 0;
 }
 
+/* Exact size of s after json_escape_into (excluding quotes). */
+static size_t json_escaped_size(const char *s) {
+    if (!s) return 0;
+
+    size_t len = strlen(s);
+    size_t size = 0;
+    for (size_t i = 0; i < len;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
+                size += 2;
+            else if (c < 0x20)
+                size += 6;
+            else
+                size++;
+            i++;
+            continue;
+        }
+
+        size_t n = nc_utf8_sequence_len(s + i, len - i);
+        if (n == 0) {
+            size += 6; /* malformed byte becomes � */
+            i++;
+        } else {
+            size += n;
+            i += n;
+        }
+    }
+    return size;
+}
+
 /* Escape a string for JSON, writing into buf+off. Returns new offset. */
 static int json_escape_into(char *buf, size_t bufsz, int off, const char *s) {
     if (!s || !buf || bufsz <= 10 || off < 0) return off;
@@ -122,8 +153,7 @@ static size_t estimate_messages_size(const nc_message *msgs, int count) {
     size_t sz = 512;
     for (int i = 0; i < count; i++) {
         sz += 512; /* per-message overhead */
-        if (msgs[i].content)
-            sz += strlen(msgs[i].content) * 2;
+        sz += json_escaped_size(msgs[i].content);
         if (msgs[i].raw_json)
             sz += strlen(msgs[i].raw_json);
         if (msgs[i].tool_call_id)
@@ -135,7 +165,7 @@ static size_t estimate_messages_size(const nc_message *msgs, int count) {
             sz += 512; /* per-call overhead */
             sz += strlen(msgs[i].tool_calls[j].id) * 2;
             sz += strlen(msgs[i].tool_calls[j].name) * 2;
-            sz += strlen(msgs[i].tool_calls[j].arguments) * 2;
+            sz += json_escaped_size(msgs[i].tool_calls[j].arguments);
         }
     }
     return sz;
